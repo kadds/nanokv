@@ -1,0 +1,4 @@
+/target
+.vscode
+nanokv_data
+Cargo.lock

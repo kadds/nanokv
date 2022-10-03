@@ -1,0 +1,2 @@
+[workspace]
+members = ["./storage", "./example/random_test"]
