@@ -166,7 +166,11 @@ mod test {
         // range get
         let mut n = 0;
         // 55, 56, 57, 59, 6, 60
-        for (idx, (key, _)) in table.scan("55", "60").filter(|(_, v)| !v.deleted() ).enumerate() {
+        for (idx, (key, _)) in table
+            .scan("55", "60")
+            .filter(|(_, v)| !v.deleted())
+            .enumerate()
+        {
             assert_ne!("58", key);
             assert_eq!(sorted_input[idx + 51], key);
             n += 1;

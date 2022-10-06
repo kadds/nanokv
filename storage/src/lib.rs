@@ -1,12 +1,12 @@
-pub mod instance;
-pub mod storage;
-pub mod value;
+mod compaction;
 pub mod config;
 mod coordinator;
-mod util;
-mod log;
+pub mod instance;
 mod kv;
-mod compaction;
+mod log;
+pub mod storage;
+mod util;
+pub mod value;
 pub type Config = config::Config;
 pub type ConfigRef = config::ConfigRef;
 pub type Storage = storage::Storage;

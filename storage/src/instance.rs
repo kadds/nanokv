@@ -1,4 +1,4 @@
-use std::{rc::Rc, fs};
+use std::{fs, rc::Rc};
 
 use crate::{config::ConfigRef, coordinator::Coordinator, storage::Storage};
 

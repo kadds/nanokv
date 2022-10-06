@@ -1,9 +1,8 @@
 use std::io;
 
-use bitflags::bitflags;
 use crate::value::Value;
+use bitflags::bitflags;
 use bytes::Bytes;
-
 
 pub trait KVReader<'a> {
     fn get_ver(&self, key: &str, ver: u64) -> Option<Value>;
@@ -20,13 +19,20 @@ pub enum SetError {
     VersionNotMatch(u64),
     KeyNotExist,
     ValueTooLarge,
-    WriteFail(io::Error)
+    WriteFail(io::Error),
 }
 
 pub type SetResult<T> = std::result::Result<T, SetError>;
 
 pub trait KVWriter {
     fn set(&mut self, entry: KvEntry) -> SetResult<()>;
+}
+
+pub trait LogSerializer<W> {
+    fn serialize_log(&self, writer: &mut W);
+}
+pub trait LogDeserializer<R> {
+    fn deserialize_log(&mut self, reader: &mut R);
 }
 
 // --------
@@ -106,6 +112,10 @@ impl KvEntry {
         self.flags & Flags::EXTERN_VALUE.bits != 0
     }
 
+    pub fn flags(&self) -> u64 {
+        self.flags
+    }
+
     pub fn new_big_value(key: String, value_offset: u64, ttl: Option<u64>, ver: u64) -> Self {
         let mut flags = Flags::EXTERN_VALUE.bits;
         if let Some(ttl) = ttl {
@@ -142,6 +152,28 @@ impl KvEntry {
     }
 }
 
+impl<W> LogSerializer<W> for KvEntry
+where
+    W: io::Write,
+{
+    fn serialize_log(&self, writer: &mut W) {
+        let buf = self.flags.to_le_bytes();
+        writer.write_all(&buf).unwrap();
+        let buf = self.ver.to_le_bytes();
+        writer.write_all(&buf).unwrap();
+        let buf = self.key.len().to_le_bytes();
+        writer.write_all(&buf).unwrap();
+        let buf = self.value().len().to_le_bytes();
+        writer.write_all(&buf).unwrap();
+
+        // key
+        writer.write_all(self.key.as_bytes()).unwrap();
+
+        // value
+        writer.write(&self.value).unwrap();
+    }
+}
+
 impl Eq for KvEntry {}
 
 impl Ord for KvEntry {
@@ -170,8 +202,8 @@ impl PartialOrd for KvEntry {
 }
 
 pub mod imemtable;
+pub mod manifest;
 pub mod memtable;
-pub mod ssfile;
+pub mod sst;
 pub type Memtable = memtable::Memtable;
 pub type Imemtable = imemtable::Imemtable;
-pub type SSFile = ssfile::SSFile;

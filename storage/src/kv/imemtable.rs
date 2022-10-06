@@ -15,16 +15,17 @@ impl From<Memtable> for Imemtable {
             keys.push(item);
         }
 
-        Self {
-            keys,
-        }
+        Self { keys }
     }
 }
 
 impl Imemtable {
     pub fn min_max(&self) -> Option<(&str, &str)> {
         if self.keys.len() > 0 {
-            Some((self.keys.first().unwrap().key(), self.keys.last().unwrap().key()))
+            Some((
+                self.keys.first().unwrap().key(),
+                self.keys.last().unwrap().key(),
+            ))
         } else {
             None
         }
@@ -39,7 +40,10 @@ impl Imemtable {
 
 impl<'a> KVReader<'a> for Imemtable {
     fn get_ver(&self, key: &str, ver: u64) -> Option<Value> {
-        let idx = self.keys.binary_search_by(|entry| entry.key().cmp(key)).ok()?;
+        let idx = self
+            .keys
+            .binary_search_by(|entry| entry.key().cmp(key))
+            .ok()?;
         while idx < self.keys.len() {
             if self.keys[idx].version() == ver {
                 return Some(Value::from_entry(&self.keys[idx]));
@@ -49,18 +53,29 @@ impl<'a> KVReader<'a> for Imemtable {
     }
 
     fn get(&self, key: &str) -> Option<Value> {
-        self.keys.binary_search_by(|entry| entry.key().cmp(key)).ok().map(|idx| Value::from_entry(&self.keys[idx]))
+        self.keys
+            .binary_search_by(|entry| entry.key().cmp(key))
+            .ok()
+            .map(|idx| Value::from_entry(&self.keys[idx]))
     }
 
     fn scan(&'a self, beg: &str, end: &str) -> Box<dyn Iterator<Item = (&'a str, Value)> + 'a> {
         let beg_index = self.keys.partition_point(|entry| entry.key() < beg);
         let end_index = self.keys.partition_point(|entry| entry.key() < end);
 
-        Box::new(self.keys[beg_index..end_index].iter().map(|entry| (entry.key(), Value::from_entry(entry))))
+        Box::new(
+            self.keys[beg_index..end_index]
+                .iter()
+                .map(|entry| (entry.key(), Value::from_entry(entry))),
+        )
     }
 
     fn iter(&'a self) -> Box<dyn Iterator<Item = (&'a str, Value)> + 'a> {
-        Box::new(self.keys.iter().map(|entry| (entry.key(), Value::from_entry(entry))))
+        Box::new(
+            self.keys
+                .iter()
+                .map(|entry| (entry.key(), Value::from_entry(entry))),
+        )
     }
 }
 
@@ -69,7 +84,7 @@ mod test {
     use crate::kv::KVWriter;
 
     use super::*;
-    use rand::{seq::SliceRandom};
+    use rand::seq::SliceRandom;
 
     fn load_test_data() -> (Vec<String>, Vec<String>) {
         let mut input: Vec<String> = (0..100).into_iter().map(|k| k.to_string()).collect();
@@ -82,7 +97,6 @@ mod test {
     fn init_table() -> (Vec<String>, Imemtable, u64) {
         let (input, mut sorted_input) = load_test_data();
         let mut ver = 0;
-
 
         let mut table = Memtable::new();
         for key in input {

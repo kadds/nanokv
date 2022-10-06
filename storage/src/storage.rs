@@ -1,35 +1,36 @@
-use std::{rc::Rc, time::Duration, mem::swap};
+use std::{mem::swap, rc::Rc, time::Duration};
 
 use bytes::Bytes;
 
 use crate::{
     coordinator::Coordinator,
     kv::{Imemtable, KVReader, KVWriter, KvEntry, Memtable, SetError, SetResult},
-    log::{LogWriter, VLogWriter}, value::Value,
+    log::LogWriter,
+    value::Value,
 };
 
 pub struct Storage {
     memtable: Memtable,
     imemtables: Vec<Imemtable>,
-    vlog: VLogWriter,
     wal: LogWriter,
     coordinator: Rc<Coordinator>,
+    seq: u64,
 }
 
 impl Storage {
     pub fn new(c: Rc<Coordinator>) -> Self {
+        let seq = c.current_sst_file_seq();
         Self {
             memtable: Memtable::new(),
             imemtables: Vec::new(),
-            vlog: VLogWriter::new(),
-            wal: LogWriter::new(),
+            wal: LogWriter::new(seq, c.config()),
             coordinator: c,
+            seq,
         }
     }
 }
 
 impl Storage {
-
     fn slow_get(&self, key: &str) -> Option<Value> {
         // todo: level0
 
@@ -38,7 +39,7 @@ impl Storage {
     }
     pub fn get(&self, key: &str) -> Option<Value> {
         // query from memtable
-        if let Some(mut value) = self.memtable.get(key) {
+        if let Some(value) = self.memtable.get(key) {
             if value.deleted() {
                 return None;
             }
@@ -47,7 +48,7 @@ impl Storage {
 
         // query from imemetable
         for table in &self.imemtables {
-            if let Some(mut value) = table.get(key) {
+            if let Some(value) = table.get(key) {
                 if value.deleted() {
                     return None;
                 }
@@ -105,24 +106,22 @@ impl Storage {
                 return Err(SetError::VersionNotMatch(latest_ver));
             }
         };
+        if value.len() > 1024 * 1024 * 10 {
+            // 10MB value
+            return Err(SetError::ValueTooLarge);
+        }
 
         let cur_ver = self.coordinator.next_version();
-
-        let entry = if value.len() > 1024 {
-            if value.len() > 1024 * 1024 * 10 { // 10MB value
-                return Err(SetError::ValueTooLarge);
-            }
-
-            KvEntry::new_big_value(key, 0, ttl.map(|d| d.as_secs()), cur_ver)
-        } else {
-            KvEntry::new(key, value, ttl.map(|d| d.as_secs()), cur_ver)
-        };
+        let entry = KvEntry::new(key, value, ttl.map(|d| d.as_secs()), cur_ver);
+        self.wal.append(&entry);
 
         self.memtable.set(entry)?;
         if self.memtable.full() {
             let mut memtable = Memtable::new();
             swap(&mut memtable, &mut self.memtable);
+            self.seq = self.coordinator.next_sst_file_seq();
 
+            self.wal.rotate(self.seq);
             self.imemtables.push(memtable.into());
         }
         Ok(())

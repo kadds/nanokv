@@ -2,7 +2,6 @@ use bytes::Bytes;
 
 use crate::kv::KvEntry;
 
-
 enum LazyValueRef {
     Inplace(Bytes),
     Extern(u64),

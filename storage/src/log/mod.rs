@@ -1,4 +1,3 @@
-pub mod vlog;
+pub mod replay;
 pub mod wal;
 pub type LogWriter = wal::LogWriter;
-pub type VLogWriter = vlog::VLogWriter;

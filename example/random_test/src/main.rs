@@ -1,14 +1,17 @@
-use bytes::Bytes;
-use rand::{Rng, RngCore};
-use rand::distributions::Alphanumeric;
 use ::storage::*;
-fn rand_key() -> String{
+use bytes::Bytes;
+use rand::distributions::Alphanumeric;
+use rand::{Rng, RngCore};
+fn rand_key() -> String {
     let mut rng = rand::thread_rng();
     let len = rng.gen_range(2..15);
-    rng.sample_iter(&Alphanumeric).take(len).map(char::from).collect()
+    rng.sample_iter(&Alphanumeric)
+        .take(len)
+        .map(char::from)
+        .collect()
 }
 
-fn rand_value() -> Bytes{
+fn rand_value() -> Bytes {
     let mut rng = rand::thread_rng();
     let len = rng.gen_range(1..8);
     let mut vec = Vec::new();
@@ -41,7 +44,9 @@ fn main() {
         }
 
         if is_deleted() && deleted_keys.len() > 0 {
-            ins.mut_storage().del(deleted_keys.first().unwrap()).unwrap();
+            ins.mut_storage()
+                .del(deleted_keys.first().unwrap())
+                .unwrap();
             deleted_keys.remove(0);
         }
 
@@ -53,5 +58,4 @@ fn main() {
             println!("finish {}%", p)
         }
     }
-
 }
