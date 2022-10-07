@@ -1,4 +1,3 @@
-mod compaction;
 pub mod config;
 mod coordinator;
 pub mod instance;

@@ -161,9 +161,9 @@ where
         writer.write_all(&buf).unwrap();
         let buf = self.ver.to_le_bytes();
         writer.write_all(&buf).unwrap();
-        let buf = self.key.len().to_le_bytes();
+        let buf = (self.key.len() as u32).to_le_bytes();
         writer.write_all(&buf).unwrap();
-        let buf = self.value().len().to_le_bytes();
+        let buf = (self.value().len() as u32).to_le_bytes();
         writer.write_all(&buf).unwrap();
 
         // key

@@ -1,12 +1,15 @@
 use super::{KVReader, KvEntry, Memtable};
 use crate::value::Value;
 
+#[derive(Debug)]
 pub struct Imemtable {
     keys: Vec<KvEntry>,
+    seq: u64,
 }
 
 impl From<Memtable> for Imemtable {
     fn from(memtable: Memtable) -> Self {
+        let seq = memtable.seq();
         let mut keys = Vec::new();
         for item in memtable.into_iter() {
             if item.deleted() {
@@ -15,7 +18,7 @@ impl From<Memtable> for Imemtable {
             keys.push(item);
         }
 
-        Self { keys }
+        Self { keys, seq }
     }
 }
 
@@ -35,6 +38,13 @@ impl Imemtable {
     }
     pub fn half_full(&self) -> bool {
         self.keys.len() > 8
+    }
+    pub fn entry_iter<'a>(&'a self) -> Box<dyn Iterator<Item = &KvEntry> + 'a> {
+        Box::new(self.keys.iter())
+    }
+
+    pub fn seq(&self) -> u64 {
+        self.seq
     }
 }
 
@@ -98,7 +108,7 @@ mod test {
         let (input, mut sorted_input) = load_test_data();
         let mut ver = 0;
 
-        let mut table = Memtable::new();
+        let mut table = Memtable::new(0);
         for key in input {
             let entry = KvEntry::new(key, "abc".into(), None, ver);
             table.set(entry).unwrap();

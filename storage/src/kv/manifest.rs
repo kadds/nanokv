@@ -21,6 +21,7 @@ pub struct FileMetaData {
     left: usize,
     right: usize,
     ref_count: u64,
+    keys: u64,
 }
 
 impl Manifest {

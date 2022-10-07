@@ -1,7 +1,7 @@
 use ::storage::*;
 use bytes::Bytes;
 use rand::distributions::Alphanumeric;
-use rand::{Rng, RngCore};
+use rand::Rng;
 fn rand_key() -> String {
     let mut rng = rand::thread_rng();
     let len = rng.gen_range(2..15);
@@ -23,7 +23,7 @@ fn rand_value() -> Bytes {
 
 fn is_deleted() -> bool {
     let mut rng = rand::thread_rng();
-    rng.gen_bool(0.05)
+    rng.gen_bool(0.09)
 }
 
 fn main() {
@@ -44,9 +44,11 @@ fn main() {
         }
 
         if is_deleted() && deleted_keys.len() > 0 {
-            ins.mut_storage()
-                .del(deleted_keys.first().unwrap())
-                .unwrap();
+            let del_key = deleted_keys.first().unwrap();
+            // make sure del_key exist
+            ins.mut_storage().get(del_key).unwrap();
+
+            ins.mut_storage().del(del_key).unwrap();
             deleted_keys.remove(0);
         }
 

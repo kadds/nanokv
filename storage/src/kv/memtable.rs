@@ -5,13 +5,15 @@ use crate::value::Value;
 pub struct Memtable {
     list: skiplist::OrderedSkipList<KvEntry>,
     total_bytes: usize,
+    seq: u64,
 }
 
 impl Memtable {
-    pub fn new() -> Self {
+    pub fn new(seq: u64) -> Self {
         Self {
             list: skiplist::OrderedSkipList::new(),
             total_bytes: 0,
+            seq,
         }
     }
 
@@ -24,6 +26,10 @@ impl Memtable {
 
     pub fn full(&self) -> bool {
         self.list.len() >= 1024 * 16 || self.total_bytes > 1024 * 1024 * 10
+    }
+
+    pub fn seq(&self) -> u64 {
+        self.seq
     }
 }
 
@@ -96,7 +102,7 @@ mod test {
         let (input, sorted_input) = load_test_data();
         let mut ver = 0;
 
-        let mut table = Memtable::new();
+        let mut table = Memtable::new(0);
         for key in input {
             let entry = KvEntry::new(key, "abc".into(), None, ver);
             table.set(entry).unwrap();

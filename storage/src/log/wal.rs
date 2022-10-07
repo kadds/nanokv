@@ -21,17 +21,23 @@ impl LogFile {
         Self { file, name }
     }
 
-    // pub fn open(sst_seq: u64) -> Self {
-    // let file = File::open(name).unwrap();
-    // Self { file, }
-    // }
+    pub fn open(sst_seq: u64, config: ConfigRef) -> Self {
+        let name = format!("{}/wal-{}.log", config.path, sst_seq);
+        let file = File::open(&name).unwrap();
+        Self { file, name }
+    }
 
     pub fn file(&mut self) -> &mut File {
         &mut self.file
     }
 
-    pub fn delete(&mut self) {
-        fs::remove_file(&self.name).unwrap();
+    pub fn remove(sst_seq: u64, config: ConfigRef) {
+        let name = format!("{}/wal-{}.log", config.path, sst_seq);
+        let _ = fs::remove_file(&name);
+    }
+
+    fn make_sure(&mut self, alloc_size: usize) {
+        self.file.set_len(alloc_size as u64).unwrap();
     }
 }
 
@@ -65,7 +71,6 @@ impl LogWriter {
 
     pub fn rotate(&mut self, sst_seq: u64) {
         self.sst_seq = sst_seq;
-        self.current.delete();
         self.current = LogFile::new(self.sst_seq, ALLOC_SIZE, self.config.clone());
     }
 }
