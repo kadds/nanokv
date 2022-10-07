@@ -1,76 +1,70 @@
 use std::{
-    fs::{self, File},
     io::{self, Write},
+    marker::PhantomData,
 };
 
-use crate::{
-    kv::{self, LogSerializer},
-    Config, ConfigRef,
-};
+use log::info;
 
-pub struct LogFile {
-    file: File,
-    name: String,
-}
+use super::{LogEntrySerializer, LogFile};
 
-impl LogFile {
-    pub fn new(sst_seq: u64, alloc_size: usize, config: ConfigRef) -> Self {
-        let name = format!("{}/wal-{}.log", config.path, sst_seq);
-        let file = File::create(&name).unwrap();
-        file.set_len(alloc_size as u64).unwrap();
-        Self { file, name }
-    }
-
-    pub fn open(sst_seq: u64, config: ConfigRef) -> Self {
-        let name = format!("{}/wal-{}.log", config.path, sst_seq);
-        let file = File::open(&name).unwrap();
-        Self { file, name }
-    }
-
-    pub fn file(&mut self) -> &mut File {
-        &mut self.file
-    }
-
-    pub fn remove(sst_seq: u64, config: ConfigRef) {
-        let name = format!("{}/wal-{}.log", config.path, sst_seq);
-        let _ = fs::remove_file(&name);
-    }
-
-    fn make_sure(&mut self, alloc_size: usize) {
-        self.file.set_len(alloc_size as u64).unwrap();
-    }
-}
-
-const ALLOC_SIZE: usize = 1024 * 1024 * 20;
-pub struct LogWriter {
+const DEFAULT_ALLOC_SIZE: usize = 1024 * 1024 * 5;
+pub struct LogWriter<E, S> {
     current: LogFile,
-    sst_seq: u64,
-    config: ConfigRef,
+    seq: u64,
+    path: String,
+    last_size: usize,
+    write_bytes: u64,
+
+    serializer: S,
+    _pd: PhantomData<E>,
 }
 
-impl LogWriter {
-    pub fn new(sst_seq: u64, config: ConfigRef) -> Self {
+impl<E, S> LogWriter<E, S>
+where
+    S: LogEntrySerializer<Entry = E>,
+{
+    pub fn new(serializer: S, seq: u64, path: String) -> Self {
         Self {
-            current: LogFile::new(sst_seq, ALLOC_SIZE, config.clone()),
-            sst_seq,
-            config,
+            current: LogFile::new(seq, DEFAULT_ALLOC_SIZE, &path),
+            seq,
+            path,
+            last_size: DEFAULT_ALLOC_SIZE,
+            write_bytes: 0,
+            serializer,
+            _pd: PhantomData::default(),
         }
     }
 }
 
-impl LogWriter {
-    pub fn append(&mut self, entry: &kv::KvEntry) {
+impl<E, S> LogWriter<E, S>
+where
+    S: LogEntrySerializer<Entry = E>,
+{
+    pub fn append(&mut self, entry: &E) {
         {
             let file = self.current.file();
             let mut writer = io::BufWriter::new(file);
-            entry.serialize_log(&mut writer);
+            self.write_bytes += self.serializer.write(entry, &mut writer);
             writer.flush().unwrap();
         }
         self.current.file().sync_data().unwrap();
     }
 
-    pub fn rotate(&mut self, sst_seq: u64) {
-        self.sst_seq = sst_seq;
-        self.current = LogFile::new(self.sst_seq, ALLOC_SIZE, self.config.clone());
+    pub fn rotate(&mut self, seq: u64) {
+        self.seq = seq;
+        self.current = LogFile::new(self.seq, self.last_size, &self.path);
+        info!("wal rotate {}/{}", self.path, seq);
+    }
+
+    pub fn remove(&mut self, seq: u64) {
+        LogFile::remove(seq, &self.path);
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.write_bytes
+    }
+
+    pub fn seq(&self) -> u64 {
+        self.seq
     }
 }

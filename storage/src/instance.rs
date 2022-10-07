@@ -1,9 +1,9 @@
 use std::{fs, rc::Rc, sync::Arc};
 
-use crate::{config::ConfigRef, coordinator::Coordinator, storage::Storage};
+use crate::{config::ConfigRef, kv::manifest::Manifest, storage::Storage};
 
 pub struct Instance {
-    coordinator: Arc<Coordinator>,
+    manifest: Arc<Manifest>,
     storage: Storage,
     conf: ConfigRef,
 }
@@ -11,11 +11,10 @@ pub struct Instance {
 impl Instance {
     pub fn new(conf: ConfigRef) -> Self {
         fs::create_dir_all(&conf.path).unwrap();
-        let coordinator = Arc::new(Coordinator::load(conf.clone()));
-        let tmp = coordinator.clone();
+        let manifest = Arc::new(Manifest::new(conf.clone()));
         Self {
-            coordinator,
-            storage: Storage::new(tmp),
+            storage: Storage::new(conf, manifest.clone()),
+            manifest,
             conf,
         }
     }

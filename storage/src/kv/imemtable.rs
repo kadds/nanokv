@@ -5,20 +5,33 @@ use crate::value::Value;
 pub struct Imemtable {
     keys: Vec<KvEntry>,
     seq: u64,
+
+    min_ver: u64,
+    max_ver: u64,
 }
 
 impl From<Memtable> for Imemtable {
     fn from(memtable: Memtable) -> Self {
         let seq = memtable.seq();
-        let mut keys = Vec::new();
+        let cap = memtable.len();
+        let mut keys = Vec::with_capacity(cap);
+        let mut min_ver = u64::MAX;
+        let mut max_ver = u64::MIN;
         for item in memtable.into_iter() {
             if item.deleted() {
                 continue;
             }
+            min_ver = min_ver.min(item.version());
+            max_ver = max_ver.max(item.version());
             keys.push(item);
         }
 
-        Self { keys, seq }
+        Self {
+            keys,
+            seq,
+            min_ver,
+            max_ver,
+        }
     }
 }
 
@@ -33,11 +46,12 @@ impl Imemtable {
             None
         }
     }
-    pub fn full(&self) -> bool {
-        self.keys.len() > 12
-    }
-    pub fn half_full(&self) -> bool {
-        self.keys.len() > 8
+    pub fn min_max_ver(&self) -> Option<(u64, u64)> {
+        if self.keys.len() > 0 {
+            Some((self.min_ver, self.max_ver))
+        } else {
+            None
+        }
     }
     pub fn entry_iter<'a>(&'a self) -> Box<dyn Iterator<Item = &KvEntry> + 'a> {
         Box::new(self.keys.iter())
@@ -45,6 +59,10 @@ impl Imemtable {
 
     pub fn seq(&self) -> u64 {
         self.seq
+    }
+
+    pub fn len(&self) -> usize {
+        self.keys.len()
     }
 }
 

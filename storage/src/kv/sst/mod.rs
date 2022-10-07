@@ -1,21 +1,19 @@
-use super::{KVReader, KvEntry};
+use std::fs;
+
+use super::{manifest::FileMetaData, KVReader, KvEntry};
 
 pub mod raw_sst;
 
-struct SSTMeta {
-    min_key: String,
-    max_key: String,
-    keys: u32,
-}
-
 pub trait SSTWriter {
-    fn write<'a, I>(&'a mut self, level: u32, iter: I)
+    fn write<'a, I>(&'a mut self, level: u32, seq: u64, iter: I) -> FileMetaData
     where
         I: Iterator<Item = &'a KvEntry>;
 }
 
-pub fn sst_name(base: &str, seq: u64) -> String {
-    format!("{}/sst-{}", base, seq)
+pub fn sst_name(base: &str, level: u32, seq: u64) -> String {
+    let parent = format!("{}/sst/{}", base, level);
+    let _ = fs::create_dir_all(parent);
+    format!("{}/sst/{}/{}", base, level, seq)
 }
 
 struct MultiSSTReader {}

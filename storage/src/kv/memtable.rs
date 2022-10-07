@@ -4,8 +4,10 @@ use crate::value::Value;
 
 pub struct Memtable {
     list: skiplist::OrderedSkipList<KvEntry>,
-    total_bytes: usize,
     seq: u64,
+
+    total_bytes: u64,
+    min_ver: u64,
 }
 
 impl Memtable {
@@ -14,6 +16,7 @@ impl Memtable {
             list: skiplist::OrderedSkipList::new(),
             total_bytes: 0,
             seq,
+            min_ver: 0,
         }
     }
 
@@ -30,6 +33,9 @@ impl Memtable {
 
     pub fn seq(&self) -> u64 {
         self.seq
+    }
+    pub fn len(&self) -> usize {
+        self.list.len()
     }
 }
 
@@ -79,6 +85,10 @@ impl<'a> KVReader<'a> for Memtable {
 
 impl KVWriter for Memtable {
     fn set(&mut self, entry: KvEntry) -> SetResult<()> {
+        if self.list.len() == 0 {
+            self.min_ver = entry.version();
+        }
+        self.total_bytes += entry.bytes();
         self.list.insert(entry);
         Ok(())
     }

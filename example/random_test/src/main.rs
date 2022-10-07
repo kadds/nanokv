@@ -27,6 +27,7 @@ fn is_deleted() -> bool {
 }
 
 fn main() {
+    env_logger::init();
     let config = config::current_config();
     let config = Box::leak(config);
 
@@ -46,7 +47,7 @@ fn main() {
         if is_deleted() && deleted_keys.len() > 0 {
             let del_key = deleted_keys.first().unwrap();
             // make sure del_key exist
-            ins.mut_storage().get(del_key).unwrap();
+            // ins.mut_storage().get(del_key).unwrap();
 
             ins.mut_storage().del(del_key).unwrap();
             deleted_keys.remove(0);

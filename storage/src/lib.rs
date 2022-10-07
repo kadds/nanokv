@@ -1,5 +1,5 @@
+pub mod compaction;
 pub mod config;
-mod coordinator;
 pub mod instance;
 mod kv;
 mod log;

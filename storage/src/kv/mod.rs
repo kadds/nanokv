@@ -1,7 +1,8 @@
 use std::io;
 
-use crate::value::Value;
+use crate::{log::LogEntrySerializer, value::Value};
 use bitflags::bitflags;
+use byteorder::{ByteOrder, ReadBytesExt, WriteBytesExt, LE};
 use bytes::Bytes;
 
 pub trait KVReader<'a> {
@@ -28,12 +29,12 @@ pub trait KVWriter {
     fn set(&mut self, entry: KvEntry) -> SetResult<()>;
 }
 
-pub trait LogSerializer<W> {
-    fn serialize_log(&self, writer: &mut W);
-}
-pub trait LogDeserializer<R> {
-    fn deserialize_log(&mut self, reader: &mut R);
-}
+// pub trait LogSerializer<W> {
+//     fn serialize_log(&self, writer: &mut W);
+// }
+// pub trait LogDeserializer<R> {
+//     fn deserialize_log(&mut self, reader: &mut R);
+// }
 
 // --------
 // |  key | string
@@ -150,27 +151,60 @@ impl KvEntry {
     pub fn value(&self) -> Bytes {
         self.value.clone()
     }
+    pub fn bytes(&self) -> u64 {
+        self.key.len() as u64 + self.value.len() as u64 + 16
+    }
 }
 
-impl<W> LogSerializer<W> for KvEntry
-where
-    W: io::Write,
-{
-    fn serialize_log(&self, writer: &mut W) {
-        let buf = self.flags.to_le_bytes();
-        writer.write_all(&buf).unwrap();
-        let buf = self.ver.to_le_bytes();
-        writer.write_all(&buf).unwrap();
-        let buf = (self.key.len() as u32).to_le_bytes();
-        writer.write_all(&buf).unwrap();
-        let buf = (self.value().len() as u32).to_le_bytes();
-        writer.write_all(&buf).unwrap();
+#[derive(Debug, Default)]
+pub struct KvEntryLogSerializer;
 
-        // key
-        writer.write_all(self.key.as_bytes()).unwrap();
+impl LogEntrySerializer for KvEntryLogSerializer {
+    type Entry = KvEntry;
 
-        // value
-        writer.write(&self.value).unwrap();
+    fn write<W>(&mut self, entry: &Self::Entry, mut w: W) -> u64
+    where
+        W: io::Write,
+    {
+        w.write_u64::<LE>(entry.flags).unwrap();
+        w.write_u64::<LE>(entry.ver).unwrap();
+        w.write_u32::<LE>(entry.key.len() as u32).unwrap();
+        w.write_all(entry.key.as_bytes()).unwrap();
+        w.write_u32::<LE>(entry.value.len() as u32).unwrap();
+        w.write_all(&entry.value).unwrap();
+
+        8 + 8 + entry.key.len() as u64 + entry.value.len() as u64
+    }
+
+    fn read<R>(&mut self, mut r: R) -> Option<Self::Entry>
+    where
+        R: io::Read,
+    {
+        let flags = r.read_u64::<LE>().ok()?;
+        let ver = r.read_u64::<LE>().ok()?;
+        let key_len = r.read_u32::<LE>().ok()?;
+        if key_len == 0 {
+            return None;
+        }
+
+        let mut vec = Vec::new();
+        vec.resize(key_len as usize, 0);
+        r.read_exact(&mut vec).unwrap();
+        let key: String = unsafe { String::from_utf8_unchecked(vec) };
+
+        let value_len = r.read_u32::<LE>().unwrap();
+        let mut vec = Vec::new();
+        vec.resize(value_len as usize, 0);
+
+        r.read_exact(&mut vec).unwrap();
+        let value = Bytes::from(vec);
+
+        Some(Self::Entry {
+            flags,
+            ver,
+            key,
+            value,
+        })
     }
 }
 
