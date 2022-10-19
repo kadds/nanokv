@@ -96,6 +96,8 @@ where
     }
 
     pub fn rotate(&mut self, seq: u64) {
+        self.sync();
+
         self.seq = seq;
         self.current = LogFile::new(self.seq, self.last_size, &self.path);
         info!("wal rotate {}/{}", self.path, seq);

@@ -198,7 +198,7 @@ impl Storage {
         None
     }
 
-    pub fn scan(&self, beg: &str, end: &str) -> Box<dyn Iterator<Item = Value>> {
+    pub fn scan(&self, beg: Option<&str>, end: Option<&str>) -> Box<dyn Iterator<Item = Value>> {
         todo!()
     }
 

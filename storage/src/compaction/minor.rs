@@ -66,7 +66,7 @@ impl MinorSerializer {
                     sst::raw_sst::RawSSTWriter::new(&sst_name(&conf.path, 0, table.seq()));
 
                 let meta = sst.write(0, seq, iter);
-                self.manifest.add_sst(meta);
+                self.manifest.add_sst(Arc::new(meta));
 
                 info!("sst {} done", seq);
             }

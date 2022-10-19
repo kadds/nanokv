@@ -12,8 +12,6 @@ use super::{LogEntrySerializer, LogFile, LogSegmentFlags, SEGMENT_CONTENT_SIZE};
 
 pub struct LogReplayer<E, S> {
     current: Option<LogFile>,
-    path: String,
-    seq: u64,
 
     serializer: S,
     _pd: PhantomData<E>,
@@ -27,8 +25,6 @@ where
         let path: String = path.into();
         let log_file = LogFile::open(seq, &path);
         Self {
-            seq,
-            path,
             current: log_file,
 
             serializer,
