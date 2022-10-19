@@ -5,6 +5,7 @@ use std::{
 
 pub mod replayer;
 pub mod wal;
+use bitflags::bitflags;
 use byteorder::{ReadBytesExt, WriteBytesExt, LE};
 pub use replayer::LogReplayer;
 pub use wal::LogWriter;
@@ -12,6 +13,24 @@ pub use wal::LogWriter;
 pub struct LogFile {
     file: File,
     name: String,
+}
+
+const SEGMENT_SIZE: usize = 1024 * 32; // 32k
+const SEGMENT_CONTENT_SIZE: usize = SEGMENT_SIZE - 4 - 2 - 1;
+
+// crc u32
+// length u16
+// flags u8
+// bytes
+
+bitflags! {
+    struct LogSegmentFlags: u8 {
+        const UNKNOWN = 0b000;
+        const FULL_FRAGMENT = 0b001;
+        const BEGIN_FRAGMENT = 0b010;
+        const MIDDLE_FRAGMENT = 0b011;
+        const LAST_FRAGMENT = 0b100;
+    }
 }
 
 impl LogFile {
@@ -63,7 +82,7 @@ impl LogEntrySerializer for String {
         W: Write,
     {
         w.write_u32::<LE>(entry.len() as u32).unwrap();
-        w.write_all(entry.as_bytes());
+        w.write_all(entry.as_bytes()).unwrap();
         4 + entry.len() as u64
     }
 
@@ -74,7 +93,7 @@ impl LogEntrySerializer for String {
         let len = r.read_u32::<LE>().unwrap();
         let mut vec = Vec::new();
         vec.resize(len as usize, 0);
-        r.read_exact(&mut vec);
+        r.read_exact(&mut vec).unwrap();
         unsafe { Some(String::from_utf8_unchecked(vec)) }
     }
 }

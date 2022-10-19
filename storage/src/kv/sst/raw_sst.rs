@@ -5,9 +5,7 @@ use crate::kv::{KVReader, KvEntry};
 use crate::value::Value;
 use byteorder::LE;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::marker::PhantomData;
-use std::slice;
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 
 use super::{FileMetaData, SSTWriter};
 
@@ -32,7 +30,7 @@ impl RawSSTReader {
     pub fn new(name: &str) -> Self {
         let mut file = File::open(name).unwrap();
         let size = file.seek(SeekFrom::End(0)).unwrap();
-        file.seek(SeekFrom::Start(0));
+        file.seek(SeekFrom::Start(0)).unwrap();
 
         let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
         let slice = mmap.get(0..size as usize).unwrap();

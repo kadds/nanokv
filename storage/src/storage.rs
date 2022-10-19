@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     mem::swap,
-    sync::{mpsc, Arc, Condvar, Mutex},
+    sync::{mpsc, Arc},
     time::Duration,
 };
 
@@ -110,7 +110,7 @@ impl Storage {
 
         let seq = manifest.allocate_sst_sequence();
 
-        let mut sf = Self {
+        let sf = Self {
             memtable: Memtable::new(seq),
             imemtables: imemtables,
             wal: LogWriter::new(log_serializer, seq, wal_path.clone()),
@@ -118,19 +118,12 @@ impl Storage {
             commit_rx,
             manifest,
         };
-        sf.restore_from_wal(&wal_path);
 
         sf
     }
 }
 
 impl Storage {
-    fn restore_from_wal(&mut self, wal_path: &str) {
-        let log_serializer = KvEntryLogSerializer::default();
-
-        self.rotate();
-    }
-
     fn shutdown(&mut self) {
         info!("shutdown storage");
         if self.memtable.len() > 0 {

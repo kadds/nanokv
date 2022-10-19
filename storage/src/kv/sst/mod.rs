@@ -13,7 +13,7 @@ pub trait SSTWriter {
 pub fn sst_name(base: &str, level: u32, seq: u64) -> String {
     let parent = format!("{}/sst/{}", base, level);
     let _ = fs::create_dir_all(parent);
-    format!("{}/sst/{}/{}", base, level, seq)
+    format!("{}/sst/{}/{}.sst", base, level, seq)
 }
 
 struct MultiSSTReader {}

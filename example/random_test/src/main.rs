@@ -35,7 +35,7 @@ fn main() {
 
     let mut deleted_keys = Vec::new();
 
-    let total_test: usize = 1000_00;
+    let total_test: usize = 1_000_000;
 
     for i in 0..total_test {
         let key = rand_key();
