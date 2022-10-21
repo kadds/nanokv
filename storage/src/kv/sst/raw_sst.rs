@@ -96,19 +96,16 @@ impl RawSSTReader {
 }
 
 impl<'a> KVReader<'a> for RawSSTReader {
-    fn get_ver(&self, key: &str, ver: u64) -> Option<Value> {
+    fn get<K: Into<Bytes>>(&self, opt: &crate::kv::GetOption, key: K) -> Option<Value> {
         todo!()
     }
 
-    fn get(&self, key: &str) -> Option<Value> {
-        todo!()
-    }
-
-    fn scan(&'a self, beg: &str, end: &str) -> Box<dyn Iterator<Item = (&'a str, Value)> + 'a> {
-        todo!()
-    }
-
-    fn iter(&'a self) -> Box<dyn Iterator<Item = (&'a str, Value)> + 'a> {
+    fn scan<K: Into<Bytes>>(
+        &'a self,
+        opt: &crate::kv::GetOption,
+        beg: K,
+        end: K,
+    ) -> Box<dyn crate::KvIterator<Item = (Bytes, Value)> + 'a> {
         todo!()
     }
 }
@@ -145,7 +142,7 @@ impl RawSSTEntry {
         total += buf.len();
         w.write_all(&buf).unwrap();
         total += entry.key.len();
-        w.write_all(&entry.key().as_bytes()).unwrap();
+        w.write_all(&entry.key()).unwrap();
 
         // value
         let buf = (entry.value().len() as u32).to_le_bytes();
@@ -275,8 +272,8 @@ impl SSTWriter for RawSSTWriter {
     {
         let mut w = BufWriter::new(&mut self.file);
 
-        let mut min_key = String::new();
-        let mut max_key = String::new();
+        let mut min_key = Bytes::new();
+        let mut max_key = Bytes::new();
         let mut last_entry = None;
         let mut keys_offset = Vec::new();
 
@@ -287,7 +284,7 @@ impl SSTWriter for RawSSTWriter {
         for entry in iter {
             // write key value entry
             if min_key.len() == 0 {
-                min_key = entry.key().to_owned();
+                min_key = entry.key();
             }
             min_ver = min_ver.min(entry.version());
             max_ver = max_ver.max(entry.version());
@@ -299,7 +296,7 @@ impl SSTWriter for RawSSTWriter {
             cur += bytes;
         }
         if let Some(entry) = last_entry {
-            max_key = entry.key().to_owned();
+            max_key = entry.key();
         }
         let key_offset_begin = w.seek(SeekFrom::Current(0)).unwrap();
 

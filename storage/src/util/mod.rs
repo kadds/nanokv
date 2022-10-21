@@ -2,7 +2,6 @@ pub mod eq_filter;
 
 const MASK_DELTA: u32 = 0xa282ead8;
 
-
 pub fn crc_mask(crc: u32) -> u32 {
     ((crc >> 15) | (crc << 17)).wrapping_add(MASK_DELTA)
 }

@@ -1,12 +1,20 @@
 pub mod compaction;
 pub mod config;
 pub mod instance;
+pub mod iterator;
 mod kv;
 mod log;
+pub mod snapshot;
 pub mod storage;
 mod util;
 pub mod value;
+pub mod option;
 pub type Config = config::Config;
 pub type ConfigRef = config::ConfigRef;
 pub type Storage = storage::Storage;
 pub type Instance = instance::Instance;
+
+pub use iterator::KvIterator;
+pub use value::Value;
+pub use option::WriteOption;
+pub use option::GetOption;

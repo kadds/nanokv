@@ -1,14 +1,17 @@
 use std::{
+    collections::LinkedList,
     fs::File,
     io::{Read, Write},
-    sync::{Mutex, Arc}, collections::LinkedList,
+    sync::{Arc, Mutex},
 };
 
 use ::log::info;
 use byteorder::{ReadBytesExt, WriteBytesExt, LE};
+use bytes::Bytes;
 
 use crate::{
     log::{self, LogEntrySerializer, LogWriter},
+    snapshot::Snapshot,
     ConfigRef,
 };
 
@@ -17,19 +20,16 @@ pub struct Version {
     sst_files: Vec<Vec<Arc<FileMetaData>>>,
 }
 
-type VersionRef = Arc<Version>;
+pub type VersionRef = Arc<Version>;
 
 impl Default for Version {
     fn default() -> Self {
         let mut sst_files = Vec::new();
         sst_files.resize((MAX_LEVEL + 1) as usize, Vec::new());
 
-        Self {
-            sst_files,
-        }
+        Self { sst_files }
     }
 }
-
 
 #[derive(Debug, Default)]
 pub struct VersionLogSerializer;
@@ -88,8 +88,8 @@ pub enum VersionEdit {
 pub struct FileMetaData {
     pub seq: u64,
 
-    pub min: String,
-    pub max: String,
+    pub min: Bytes,
+    pub max: Bytes,
     pub min_ver: u64,
     pub max_ver: u64,
 
@@ -103,8 +103,8 @@ pub struct FileMetaData {
 impl FileMetaData {
     pub fn new(
         seq: u64,
-        min: String,
-        max: String,
+        min: Bytes,
+        max: Bytes,
         min_ver: u64,
         max_ver: u64,
         keys: u64,
@@ -141,9 +141,9 @@ impl LogEntrySerializer for FileMetaDataLogSerializer {
         w.write_u64::<LE>(entry.keys).unwrap();
         w.write_u32::<LE>(entry.level).unwrap();
         w.write_u32::<LE>(entry.min.len() as u32).unwrap();
-        w.write_all(entry.min.as_bytes()).unwrap();
+        w.write_all(&entry.min).unwrap();
         w.write_u32::<LE>(entry.max.len() as u32).unwrap();
-        w.write_all(entry.max.as_bytes()).unwrap();
+        w.write_all(&entry.max).unwrap();
         32 + 4 + 8 + entry.min.len() as u64 + entry.max.len() as u64
     }
 
@@ -161,13 +161,13 @@ impl LogEntrySerializer for FileMetaDataLogSerializer {
         let mut vec = Vec::new();
         vec.resize(min_key_len as usize, 0);
         r.read_exact(&mut vec).unwrap();
-        let min_key = unsafe { String::from_utf8_unchecked(vec) };
+        let min_key = vec.into();
 
         let max_key_len = r.read_u32::<LE>().unwrap();
         let mut vec = Vec::new();
         vec.resize(max_key_len as usize, 0);
         r.read_exact(&mut vec).unwrap();
-        let max_key = unsafe { String::from_utf8_unchecked(vec) };
+        let max_key = vec.into();
 
         Some(Self::Entry {
             seq,
@@ -241,7 +241,9 @@ impl LogEntrySerializer for ManifestLogSerializer {
             2 => Some(VersionEdit::SSTRemove(r.read_u64::<LE>().ok()?)),
             3 => Some(VersionEdit::VersionChanged(r.read_u64::<LE>().ok()?)),
             4 => Some(VersionEdit::SSTSequenceChanged(r.read_u64::<LE>().ok()?)),
-            5 => Some(VersionEdit::ManifestSequenceChanged(r.read_u64::<LE>().ok()?)),
+            5 => Some(VersionEdit::ManifestSequenceChanged(
+                r.read_u64::<LE>().ok()?,
+            )),
             6 => {
                 let mut s = VersionLogSerializer::default();
                 Some(VersionEdit::Snapshot(Arc::new(s.read(&mut r)?)))
@@ -259,9 +261,7 @@ pub struct VersionSet {
     last_manifest_seq: u64,
 }
 
-impl VersionSet {
-}
-
+impl VersionSet {}
 
 impl VersionSet {
     pub fn add(&mut self, edit: VersionEdit) {
@@ -296,9 +296,7 @@ impl VersionSet {
             VersionEdit::ManifestSequenceChanged(seq) => {
                 self.last_manifest_seq = seq;
             }
-            VersionEdit::Snapshot(ver) => {
-                self.current.push_front(ver)
-            }
+            VersionEdit::Snapshot(ver) => self.current.push_front(ver),
         }
     }
 
@@ -311,7 +309,10 @@ impl VersionSet {
     }
 
     fn new_current_version(&self) -> Version {
-        self.current.front().map(|v| v.as_ref().clone()).unwrap_or_default()
+        self.current
+            .front()
+            .map(|v| v.as_ref().clone())
+            .unwrap_or_default()
     }
 }
 
@@ -449,5 +450,9 @@ impl Manifest {
         let ver = self.version_set.lock().unwrap();
         ver.current()
     }
-}
 
+    pub fn snapshot(&self) -> Snapshot {
+        let ver = self.version_set.lock().unwrap();
+        Snapshot::new(ver.last_version, ver.current())
+    }
+}

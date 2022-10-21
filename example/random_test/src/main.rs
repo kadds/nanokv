@@ -47,13 +47,13 @@ fn main() {
         if is_deleted() && deleted_keys.len() > 0 {
             let del_key = deleted_keys.first().unwrap();
             // make sure del_key exist
-            // ins.mut_storage().get(del_key).unwrap();
+            ins.mut_storage().get(&GetOption::default(), del_key.clone()).unwrap();
 
-            ins.mut_storage().del(del_key).unwrap();
+            ins.mut_storage().del(&WriteOption::default(), del_key).unwrap();
             deleted_keys.remove(0);
         }
 
-        ins.mut_storage().set(key, value).unwrap();
+        ins.mut_storage().set(&WriteOption::default(), key, value).unwrap();
 
         let p = i / (total_test / 100);
 
@@ -61,4 +61,6 @@ fn main() {
             println!("finish {}%", p)
         }
     }
+
+    let iter = ins.mut_storage().scan(&GetOption::default(),"", "zzzzzzzzzz");
 }

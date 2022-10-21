@@ -1,5 +1,7 @@
-use super::{KVReader, KvEntry, Memtable};
-use crate::value::Value;
+use bytes::Bytes;
+
+use super::{GetOption, KVReader, KvEntry, Memtable};
+use crate::{iterator::Iter, value::Value, KvIterator};
 
 #[derive(Debug)]
 pub struct Imemtable {
@@ -36,11 +38,11 @@ impl From<Memtable> for Imemtable {
 }
 
 impl Imemtable {
-    pub fn min_max(&self) -> Option<(&str, &str)> {
+    pub fn min_max(&self) -> Option<(Bytes, Bytes)> {
         if self.keys.len() > 0 {
             Some((
-                self.keys.first().unwrap().key(),
-                self.keys.last().unwrap().key(),
+                self.keys.first().unwrap().key().clone(),
+                self.keys.last().unwrap().key().clone(),
             ))
         } else {
             None
@@ -67,49 +69,57 @@ impl Imemtable {
 }
 
 impl<'a> KVReader<'a> for Imemtable {
-    fn get_ver(&self, key: &str, ver: u64) -> Option<Value> {
-        let idx = self
+    fn get<K: Into<Bytes>>(&self, opt: &GetOption, key: K) -> Option<Value> {
+        let key = key.into();
+
+        let mut idx = self
             .keys
-            .binary_search_by(|entry| entry.key().cmp(key))
+            .binary_search_by(|entry| entry.key().cmp(&key))
             .ok()?;
-        while idx < self.keys.len() {
-            if self.keys[idx].version() == ver {
-                return Some(Value::from_entry(&self.keys[idx]));
+
+        if let Some(snapshot) = &opt.snapshot() {
+            while idx < self.keys.len() {
+                if self.keys[idx].version() <= snapshot.version() {
+                    return Some(Value::from_entry(&self.keys[idx]));
+                }
+                idx += 1;
             }
+        } else {
+            return Some(Value::from_entry(&self.keys[idx]));
         }
         None
     }
 
-    fn get(&self, key: &str) -> Option<Value> {
-        self.keys
-            .binary_search_by(|entry| entry.key().cmp(key))
-            .ok()
-            .map(|idx| Value::from_entry(&self.keys[idx]))
-    }
+    fn scan<K: Into<Bytes>>(
+        &'a self,
+        opt: &GetOption,
+        beg: K,
+        end: K,
+    ) -> Box<dyn KvIterator<Item = (Bytes, Value)> + 'a> {
+        let beg = beg.into();
+        let end = end.into();
+        let beg_index = if beg.len() == 0 {
+            0
+        } else {
+            self.keys.partition_point(|entry| entry.key() < beg)
+        };
+        let end_index = if end.len() == 0 {
+            self.keys.len()
+        } else {
+            self.keys.partition_point(|entry| entry.key() < end)
+        };
 
-    fn scan(&'a self, beg: &str, end: &str) -> Box<dyn Iterator<Item = (&'a str, Value)> + 'a> {
-        let beg_index = self.keys.partition_point(|entry| entry.key() < beg);
-        let end_index = self.keys.partition_point(|entry| entry.key() < end);
-
-        Box::new(
+        Box::new(Iter::from(
             self.keys[beg_index..end_index]
                 .iter()
                 .map(|entry| (entry.key(), Value::from_entry(entry))),
-        )
-    }
-
-    fn iter(&'a self) -> Box<dyn Iterator<Item = (&'a str, Value)> + 'a> {
-        Box::new(
-            self.keys
-                .iter()
-                .map(|entry| (entry.key(), Value::from_entry(entry))),
-        )
+        ))
     }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::kv::KVWriter;
+    use crate::kv::{KVWriter, WriteOption};
 
     use super::*;
     use rand::seq::SliceRandom;
@@ -128,14 +138,16 @@ mod test {
 
         let mut table = Memtable::new(0);
         for key in input {
-            let entry = KvEntry::new(key, "abc".into(), None, ver);
-            table.set(entry).unwrap();
+            let entry = KvEntry::new(key, "abc", None, ver);
+            table.set(&WriteOption::default(), entry).unwrap();
             ver += 1;
         }
         // remove 0
         sorted_input.remove(0);
 
-        table.set(KvEntry::new_del("0".to_owned(), ver)).unwrap();
+        table
+            .set(&WriteOption::default(), KvEntry::new_del("0", ver))
+            .unwrap();
 
         (sorted_input, table.into(), ver)
     }
@@ -144,15 +156,15 @@ mod test {
     pub fn test_imemtable() {
         let (sorted_input, itable, _) = init_table();
 
-        for (idx, (key, _)) in itable.iter().enumerate() {
+        for (idx, (key, _)) in itable.scan(&GetOption::default(), "", "").enumerate() {
             assert_eq!(sorted_input[idx], key);
         }
-        assert_eq!(itable.iter().count(), 99);
+        assert_eq!(itable.scan(&GetOption::default(), "", "").count(), 99);
         assert_eq!(
             itable.min_max().unwrap(),
             (
-                sorted_input.first().unwrap().as_str(),
-                sorted_input.last().unwrap().as_str()
+                Bytes::from(sorted_input.first().unwrap().clone()),
+                Bytes::from(sorted_input.last().unwrap().clone())
             )
         );
     }

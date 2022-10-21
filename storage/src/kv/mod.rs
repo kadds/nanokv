@@ -1,18 +1,19 @@
-use std::io;
+use std::io::{self, Read};
 
-use crate::{log::LogEntrySerializer, value::Value};
+use crate::{log::LogEntrySerializer, snapshot::Snapshot, value::Value, KvIterator, GetOption, WriteOption};
 use bitflags::bitflags;
 use byteorder::{ByteOrder, ReadBytesExt, WriteBytesExt, LE};
-use bytes::Bytes;
+use bytes::{BufMut, Bytes};
 
 pub trait KVReader<'a> {
-    fn get_ver(&self, key: &str, ver: u64) -> Option<Value>;
+    fn get<K: Into<Bytes>>(&self, opt: &GetOption, key: K) -> Option<Value>;
 
-    fn get(&self, key: &str) -> Option<Value>;
-
-    fn scan(&'a self, beg: &str, end: &str) -> Box<dyn Iterator<Item = (&'a str, Value)> + 'a>;
-
-    fn iter(&'a self) -> Box<dyn Iterator<Item = (&'a str, Value)> + 'a>;
+    fn scan<K: Into<Bytes>>(
+        &'a self,
+        opt: &GetOption,
+        beg: K,
+        end: K,
+    ) -> Box<dyn KvIterator<Item = (Bytes, Value)> + 'a>;
 }
 
 #[derive(Debug)]
@@ -26,7 +27,7 @@ pub enum SetError {
 pub type SetResult<T> = std::result::Result<T, SetError>;
 
 pub trait KVWriter {
-    fn set(&mut self, entry: KvEntry) -> SetResult<()>;
+    fn set(&mut self, opt: &WriteOption, entry: KvEntry) -> SetResult<()>;
 }
 
 // pub trait LogSerializer<W> {
@@ -58,14 +59,19 @@ bitflags! {
 
 #[derive(Debug, Clone)]
 pub struct KvEntry {
-    key: String,
+    key: Bytes,
     flags: u64,
     ver: u64,
     value: Bytes,
 }
 
 impl KvEntry {
-    pub fn new(key: String, value: Bytes, ttl: Option<u64>, ver: u64) -> Self {
+    pub fn new<K: Into<Bytes>, V: Into<Bytes>>(
+        key: K,
+        value: V,
+        ttl: Option<u64>,
+        ver: u64,
+    ) -> Self {
         let mut flags = 0;
         if let Some(ttl) = ttl {
             flags |= Flags::TTL.bits;
@@ -73,26 +79,27 @@ impl KvEntry {
         }
 
         Self {
-            key,
-            value,
+            key: key.into(),
+            value: value.into(),
             flags,
             ver,
         }
     }
-    pub fn new_del(key: String, ver: u64) -> Self {
+
+    pub fn new_del<K: Into<Bytes>>(key: K, ver: u64) -> Self {
         let flags = Flags::DEL.bits;
 
         Self {
-            key,
+            key: key.into(),
             value: Bytes::new(),
             flags,
             ver,
         }
     }
 
-    pub fn from_search(key: String, ver: u64) -> Self {
+    pub fn from_search<K: Into<Bytes>>(key: K, ver: u64) -> Self {
         Self {
-            key,
+            key: key.into(),
             value: Bytes::new(),
             flags: 0,
             ver,
@@ -117,7 +124,7 @@ impl KvEntry {
         self.flags
     }
 
-    pub fn new_big_value(key: String, value_offset: u64, ttl: Option<u64>, ver: u64) -> Self {
+    pub fn new_big_value(key: Bytes, value_offset: u64, ttl: Option<u64>, ver: u64) -> Self {
         let mut flags = Flags::EXTERN_VALUE.bits;
         if let Some(ttl) = ttl {
             flags |= Flags::TTL.bits;
@@ -145,8 +152,8 @@ impl KvEntry {
     pub fn version(&self) -> u64 {
         self.ver
     }
-    pub fn key(&self) -> &str {
-        &self.key
+    pub fn key(&self) -> Bytes {
+        self.key.clone()
     }
     pub fn value(&self) -> Bytes {
         self.value.clone()
@@ -169,7 +176,8 @@ impl LogEntrySerializer for KvEntryLogSerializer {
         w.write_u64::<LE>(entry.flags).unwrap();
         w.write_u64::<LE>(entry.ver).unwrap();
         w.write_u32::<LE>(entry.key.len() as u32).unwrap();
-        w.write_all(entry.key.as_bytes()).unwrap();
+        w.write_all(&entry.key).unwrap();
+
         w.write_u32::<LE>(entry.value.len() as u32).unwrap();
         w.write_all(&entry.value).unwrap();
 
@@ -190,7 +198,7 @@ impl LogEntrySerializer for KvEntryLogSerializer {
         let mut vec = Vec::new();
         vec.resize(key_len as usize, 0);
         r.read_exact(&mut vec).unwrap();
-        let key: String = unsafe { String::from_utf8_unchecked(vec) };
+        let key = Bytes::from(vec);
 
         let value_len = r.read_u32::<LE>().unwrap();
         let mut vec = Vec::new();
