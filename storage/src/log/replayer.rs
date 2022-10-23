@@ -59,30 +59,28 @@ where
                 buf.resize(length as usize, 0);
                 file_reader.read_exact(&mut buf).unwrap();
                 done = true;
+            } else if flags == LogSegmentFlags::BEGIN_FRAGMENT.bits {
+                if need_end_flag {
+                    panic!("flags check fail");
+                }
+                need_end_flag = true;
+                buf.resize(length as usize, 0);
+                file_reader.read_exact(&mut buf).unwrap();
             } else {
-                if flags == LogSegmentFlags::BEGIN_FRAGMENT.bits {
-                    if need_end_flag {
-                        panic!("flags check fail");
-                    }
-                    need_end_flag = true;
-                    buf.resize(length as usize, 0);
-                    file_reader.read_exact(&mut buf).unwrap();
-                } else {
-                    if !need_end_flag {
-                        panic!("flags check fail");
-                    }
-                    if flags == LogSegmentFlags::MIDDLE_FRAGMENT.bits {
-                        buf.resize(pos + length as usize, 0);
-                        file_reader.read_exact(&mut buf[pos..]).unwrap();
-                    } else if flags == LogSegmentFlags::LAST_FRAGMENT.bits {
-                        done = true;
-                        need_end_flag = false;
+                if !need_end_flag {
+                    panic!("flags check fail");
+                }
+                if flags == LogSegmentFlags::MIDDLE_FRAGMENT.bits {
+                    buf.resize(pos + length as usize, 0);
+                    file_reader.read_exact(&mut buf[pos..]).unwrap();
+                } else if flags == LogSegmentFlags::LAST_FRAGMENT.bits {
+                    done = true;
+                    need_end_flag = false;
 
-                        buf.resize(pos + length as usize, 0);
-                        file_reader.read_exact(&mut buf[pos..]).unwrap();
-                    } else {
-                        break;
-                    }
+                    buf.resize(pos + length as usize, 0);
+                    file_reader.read_exact(&mut buf[pos..]).unwrap();
+                } else {
+                    break;
                 }
             }
             // crc check

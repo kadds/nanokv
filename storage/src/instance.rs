@@ -1,4 +1,4 @@
-use std::{fs, rc::Rc, sync::Arc};
+use std::{fs, sync::Arc};
 
 use crate::{config::ConfigRef, kv::manifest::Manifest, storage::Storage};
 

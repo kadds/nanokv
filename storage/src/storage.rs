@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     fs,
     mem::swap,
-    ops::{Range, RangeBounds},
+    ops::RangeBounds,
     sync::{mpsc, Arc},
     time::Duration,
 };
@@ -16,8 +16,7 @@ use crate::{
     iterator::{MergedIter, ScanIter},
     kv::{manifest::FileMetaData, sst::SnapshotTable},
     log::LogReplayer,
-    snapshot::Snapshot,
-    GetOption, KvIterator, WriteOption,
+    GetOption, WriteOption,
 };
 use crate::{
     compaction::CompactSerializer,
@@ -50,11 +49,13 @@ impl Imemtables {
     }
 
     fn commit(&mut self, table: Arc<Imemtable>) {
-        assert!(self.imemtables.len() > 0 && self.imemtables.front().unwrap().seq() == table.seq());
+        assert!(
+            !self.imemtables.is_empty() && self.imemtables.front().unwrap().seq() == table.seq()
+        );
         self.imemtables.pop_front();
     }
     fn empty(&self) -> bool {
-        self.imemtables.len() == 0
+        self.imemtables.is_empty()
     }
 }
 
@@ -85,20 +86,12 @@ impl Imemtables {
 pub struct Storage {
     memtable: Memtable,
     imemtables: Imemtables,
-    wal: LogWriter<KvEntry, KvEntryLogSerializer>,
+    wal: Option<LogWriter<KvEntry, KvEntryLogSerializer>>,
     serializer: Arc<MinorSerializer>,
     commit_rx: mpsc::Receiver<(Arc<Imemtable>, Arc<FileMetaData>)>,
     manifest: Arc<Manifest>,
     config: ConfigRef,
     cache: Cache,
-}
-
-pub struct Scanner {}
-
-impl Scanner {
-    fn scanner(&self) {}
-
-    fn iter(&self) {}
 }
 
 impl Storage {
@@ -107,6 +100,7 @@ impl Storage {
         let (commit_tx, commit_rx) = mpsc::sync_channel(20);
         let wal_path = format!("{}/wal/", config.path);
         fs::create_dir_all(&wal_path).unwrap();
+        crate::kv::sst::prepare_sst_dir(&config.path);
 
         let log_serializer = KvEntryLogSerializer::default();
         let serializer = MinorSerializer::new(config.clone(), manifest.clone(), commit_tx);
@@ -137,19 +131,22 @@ impl Storage {
         }
 
         let seq = manifest.allocate_sst_sequence();
+        let wal = if config.no_wal {
+            None
+        } else {
+            Some(LogWriter::new(log_serializer, seq, wal_path))
+        };
 
-        let sf = Self {
+        Self {
             memtable: Memtable::new(seq),
-            imemtables: imemtables,
-            wal: LogWriter::new(log_serializer, seq, wal_path.clone()),
+            imemtables,
+            wal,
             serializer,
             commit_rx,
             manifest,
             cache: Cache::new(config.clone()),
             config,
-        };
-
-        sf
+        }
     }
 }
 
@@ -180,8 +177,7 @@ impl Storage {
         };
 
         if let Some(value) =
-            SnapshotTable::new(sn, self.manifest.current(), self.config, &self.cache)
-                .get(opt, key.clone())
+            SnapshotTable::new(sn, self.manifest.current(), self.config, &self.cache).get(opt, key)
         {
             if value.deleted() {
                 return None;
@@ -210,10 +206,10 @@ impl Storage {
 
         iters.push(
             SnapshotTable::new(sn, self.manifest.current(), self.config, &self.cache)
-                .scan(opt, range.clone()),
+                .scan(opt, range),
         );
 
-        ScanIter::new(MergedIter::new(iters).filter(|(key, value)| !value.deleted()))
+        ScanIter::new(MergedIter::new(iters).filter(|(_, value)| !value.deleted()))
     }
 
     pub fn set<K: Into<Bytes>>(
@@ -221,7 +217,7 @@ impl Storage {
         opt: &WriteOption,
         key: K,
         value: Bytes,
-    ) -> SetResult<()> {
+    ) -> SetResult<u64> {
         self.set_by(opt, key, value, None, None)
     }
 
@@ -232,7 +228,7 @@ impl Storage {
         value: Bytes,
         ver: Option<u64>,
         ttl: Option<Duration>,
-    ) -> SetResult<()> {
+    ) -> SetResult<u64> {
         if value.len() > 1024 * 1024 * 10 {
             // 10MB value
             return Err(SetError::ValueTooLarge);
@@ -251,23 +247,28 @@ impl Storage {
 
         let cur_ver = self.manifest.allocate_version(1);
         let entry = KvEntry::new(key, value, ttl.map(|d| d.as_secs()), cur_ver);
-        self.wal.append(&entry);
-        if opt.fsync() {
-            self.wal.sync();
+
+        if let Some(wal) = &mut self.wal {
+            wal.append(&entry);
+            if opt.fsync() {
+                wal.sync();
+            }
         }
 
         self.memtable.set(opt, entry)?;
-        if self.memtable.full() || self.wal.bytes() >= 1024 * 1024 * 50 {
+        if self.memtable.full() {
             self.rotate();
         }
-        Ok(())
+        Ok(cur_ver)
     }
 
-    pub fn del<S: Into<String>>(&mut self, opt: &WriteOption, key: S) -> SetResult<()> {
+    pub fn del<S: Into<String>>(&mut self, opt: &WriteOption, key: S) -> SetResult<u64> {
         let cur_ver = self.manifest.allocate_version(1);
 
         let entry = KvEntry::new_del(key.into(), cur_ver);
-        self.memtable.set(opt, entry)
+        self.memtable.set(opt, entry)?;
+
+        Ok(cur_ver)
     }
 }
 
@@ -280,7 +281,10 @@ impl Storage {
         let mut memtable = Memtable::new(new_seq);
         swap(&mut memtable, &mut self.memtable);
 
-        self.wal.rotate(new_seq);
+        if let Some(wal) = &mut self.wal {
+            wal.rotate(new_seq);
+        }
+
         let table = self.imemtables.push(Imemtable::new(
             memtable,
             self.manifest.oldest_snapshot_version(),
@@ -288,7 +292,10 @@ impl Storage {
         self.serializer.compact_async(table);
 
         while let Ok((table, meta)) = self.commit_rx.try_recv() {
-            self.wal.remove(table.seq());
+            if let Some(wal) = &mut self.wal {
+                wal.remove(table.seq());
+            }
+
             self.imemtables.commit(table);
             self.manifest.add_sst(meta);
         }
@@ -309,7 +316,10 @@ impl Storage {
 
         while !self.imemtables.empty() {
             if let Ok((table, meta)) = self.commit_rx.recv() {
-                self.wal.remove(table.seq());
+                if let Some(wal) = &mut self.wal {
+                    wal.remove(table.seq());
+                }
+
                 self.imemtables.commit(table);
                 self.manifest.add_sst(meta);
             } else {

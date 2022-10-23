@@ -1,35 +1,72 @@
 use byteorder::ByteOrder;
 use bytes::Bytes;
+use log::info;
 
-use crate::kv::KvEntry;
+use crate::iterator::{EqualFilter, IteratorContext, ScanIter};
+use crate::kv::{kv_entry_to_value, KvEntry};
 use crate::value::Value;
+use crate::KvIterator;
 use byteorder::LE;
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
-use std::ops::{Range, RangeBounds};
 use std::sync::Arc;
 
 use super::{FileMetaData, SSTReader, SSTWriter};
 
-struct RawSSTIterator {}
+struct RawSSTIter<'a> {
+    reader: &'a RawSSTReaderInner,
+    beg: u64,
+    end: u64,
+    idx: u64,
+}
 
-impl Iterator for RawSSTIterator {
+impl<'a> Iterator for RawSSTIter<'a> {
     type Item = KvEntry;
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        if self.idx >= self.end {
+            return None;
+        }
+        let idx = self.idx;
+        self.idx += 1;
+        let val = self.reader.index(idx)?;
+        Some(val.into())
     }
 }
 
-pub struct RawSSTReader {
+impl<'a> DoubleEndedIterator for RawSSTIter<'a> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.idx <= self.beg {
+            return None;
+        }
+        let idx = self.idx;
+        self.idx -= 1;
+        Some(self.reader.index(idx)?.into())
+    }
+}
+
+impl<'a> KvIterator for RawSSTIter<'a> {
+    fn prefetch(&mut self, _n: usize) {}
+}
+
+struct RawSSTReaderInner {
     mmap: memmap2::Mmap,
     file: File,
     size: u64,
     meta: RawSSTMetaInfo,
+    seq: u64,
+}
+
+impl IteratorContext for RawSSTReaderInner {
+    fn release(&mut self) {}
+}
+
+pub struct RawSSTReader {
+    inner: Arc<RawSSTReaderInner>,
 }
 
 impl RawSSTReader {
-    pub fn new(name: &str) -> Self {
+    pub fn new(name: &str, seq: u64) -> Self {
         let mut file = File::open(name).unwrap();
         let size = file.seek(SeekFrom::End(0)).unwrap();
         file.seek(SeekFrom::Start(0)).unwrap();
@@ -40,17 +77,21 @@ impl RawSSTReader {
         let meta = RawSSTMetaInfo::read(slice);
 
         Self {
-            mmap,
-            file,
-            meta,
-            size,
+            inner: RawSSTReaderInner {
+                mmap,
+                file,
+                meta,
+                size,
+                seq,
+            }
+            .into(),
         }
     }
 }
 
-impl RawSSTReader {
+impl RawSSTReaderInner {
     fn lower_bound(&self, key: &Bytes) -> u64 {
-        let mut left = 0 as u64;
+        let mut left = 0_u64;
         let mut right = self.meta.total_keys;
 
         while left < right {
@@ -65,7 +106,7 @@ impl RawSSTReader {
         left
     }
     fn upper_bound(&self, key: &Bytes) -> u64 {
-        let mut left = 0 as u64;
+        let mut left = 0_u64;
         let mut right = self.meta.total_keys;
 
         while left < right {
@@ -103,15 +144,15 @@ impl RawSSTReader {
 impl SSTReader for RawSSTReader {
     fn get(&self, opt: &crate::GetOption, key: Bytes) -> Option<Value> {
         let ver = opt.snapshot().map(|v| v.version()).unwrap_or(u64::MAX);
-        let mut index = self.lower_bound(&key);
+        let mut index = self.inner.lower_bound(&key);
         loop {
-            let entry = match self.index(index) {
+            let entry = match self.inner.index(index) {
                 Some(e) => e,
                 None => break,
             };
             if entry.key_bytes == key {
                 if entry.version <= ver {
-                    return Some(Value::new(entry.value_bytes, entry.version));
+                    return Some(Value::from_entry(&entry.into()));
                 }
             } else {
                 break;
@@ -127,8 +168,36 @@ impl SSTReader for RawSSTReader {
         opt: &crate::GetOption,
         beg: std::ops::Bound<bytes::Bytes>,
         end: std::ops::Bound<bytes::Bytes>,
-    ) -> crate::iterator::ScanIter<(bytes::Bytes, crate::Value)> {
-        todo!()
+    ) -> ScanIter<(bytes::Bytes, crate::Value)> {
+        let beg = match beg {
+            std::ops::Bound::Included(val) => self.inner.lower_bound(&val),
+            std::ops::Bound::Excluded(val) => self.inner.upper_bound(&val),
+            std::ops::Bound::Unbounded => 0,
+        };
+        let end = match end {
+            std::ops::Bound::Included(val) => self.inner.upper_bound(&val),
+            std::ops::Bound::Excluded(val) => self.inner.lower_bound(&val),
+            std::ops::Bound::Unbounded => self.inner.meta.total_keys,
+        };
+
+        let reader = unsafe {
+            core::mem::transmute::<_, &'static RawSSTReaderInner>(self.inner.clone().as_ref())
+        };
+
+        let iter = RawSSTIter {
+            reader,
+            beg,
+            end,
+            idx: beg,
+        };
+
+        if let Some(snapshot) = opt.snapshot() {
+            let snapshot_ver = snapshot.version();
+            let iter = iter.filter(move |entry| entry.version() <= snapshot_ver);
+            ScanIter::new(EqualFilter::new(iter).map(kv_entry_to_value)).with(self.inner.clone())
+        } else {
+            ScanIter::new(EqualFilter::new(iter).map(kv_entry_to_value)).with(self.inner.clone())
+        }
     }
 }
 
@@ -203,15 +272,26 @@ impl RawSSTEntry {
 
     fn read_key(buf: &[u8]) -> &str {
         let mut offset = 0;
-        let flags = LE::read_u64(&buf[offset..]);
+        let _flags = LE::read_u64(&buf[offset..]);
         offset += 8;
-        let version = LE::read_u64(&buf[offset..]);
+        let _version = LE::read_u64(&buf[offset..]);
         offset += 8;
         let key_len = LE::read_u32(&buf[offset..]);
-        // offset += 4;
+        offset += 4;
         // offset += key_len as usize;
 
         unsafe { std::str::from_utf8_unchecked(&buf[offset..(offset + key_len as usize)]) }
+    }
+}
+
+impl Into<KvEntry> for RawSSTEntry {
+    fn into(self) -> KvEntry {
+        KvEntry {
+            key: self.key_bytes,
+            flags: self.flags,
+            ver: self.version,
+            value: self.value_bytes,
+        }
     }
 }
 
@@ -305,13 +385,13 @@ impl SSTWriter for RawSSTWriter {
         let mut cur = 0;
         for entry in iter {
             // write key value entry
-            if min_key.len() == 0 {
+            if min_key.is_empty() {
                 min_key = entry.key();
             }
             min_ver = min_ver.min(entry.version());
             max_ver = max_ver.max(entry.version());
 
-            let bytes = RawSSTEntry::write(&entry, &mut w);
+            let bytes = RawSSTEntry::write(entry, &mut w);
             last_entry = Some(entry);
 
             keys_offset.push(cur);

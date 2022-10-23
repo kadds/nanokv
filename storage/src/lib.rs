@@ -39,7 +39,7 @@ mod test {
         let input = load_test_data();
         let mut ver = 0;
 
-        let mut table = Memtable::new(0);
+        let table = Memtable::new(0);
         let opt = WriteOption::default();
         let mut sorted_input = Vec::new();
 

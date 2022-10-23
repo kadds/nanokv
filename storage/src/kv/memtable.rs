@@ -1,13 +1,13 @@
-use std::ops::{Bound, Range, RangeBounds};
-use std::rc::Rc;
+use std::ops::{Bound, RangeBounds};
+
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use bytes::Bytes;
 
-use super::{GetOption, Imemtable, KvEntry, SetResult, WriteOption};
-use crate::iterator::{IteratorContext, ScanIter};
-use crate::util::eq_filter::EqualFilter;
+use super::{GetOption, KvEntry, SetResult, WriteOption};
+use crate::iterator::{EqualFilter, IteratorContext, ScanIter};
+use crate::kv::kv_entry_ref_to_value;
 use crate::value::Value;
 
 #[derive(Debug, Default)]
@@ -72,11 +72,9 @@ impl Memtable {
                 .filter(|entry| entry.key == key)
                 .find(|entry| entry.ver <= snapshot.version())
                 .map(Value::from_entry);
-        } else {
-            if let Some(entry) = iter.next() {
-                if entry.key == key {
-                    return Some(Value::from_entry(entry));
-                }
+        } else if let Some(entry) = iter.next() {
+            if entry.key == key {
+                return Some(Value::from_entry(entry));
             }
         }
 
@@ -113,16 +111,9 @@ impl Memtable {
         if let Some(snapshot) = opt.snapshot() {
             let snapshot_ver = snapshot.version();
             let iter = iter.filter(move |entry| entry.version() <= snapshot_ver);
-            ScanIter::new(
-                EqualFilter::new(iter, |a: &&KvEntry, b: &&KvEntry| !a.equal_key(b))
-                    .map(|entry| (entry.key(), Value::from_entry(entry))),
-            )
-            .with(inner)
+            ScanIter::new(EqualFilter::new(iter).map(kv_entry_ref_to_value)).with(inner)
         } else {
-            ScanIter::new(
-                EqualFilter::new(iter, |a: &&KvEntry, b: &&KvEntry| !a.equal_key(b))
-                    .map(|entry| (entry.key(), Value::from_entry(entry))),
-            )
+            ScanIter::new(EqualFilter::new(iter).map(kv_entry_ref_to_value)).with(inner)
         }
     }
 }
@@ -139,14 +130,14 @@ fn map_bound<'a, T>(b: &'a Bound<T>) -> Bound<&'a T> {
 }
 
 impl Memtable {
-    pub fn set(&self, opt: &WriteOption, entry: KvEntry) -> SetResult<()> {
-        if self.inner.list.len() == 0 {
+    pub fn set(&self, _opt: &WriteOption, entry: KvEntry) -> SetResult<()> {
+        if self.inner.list.is_empty() {
             self.min_ver
                 .store(entry.version(), std::sync::atomic::Ordering::Release);
         }
         self.total_bytes
             .fetch_add(entry.bytes(), std::sync::atomic::Ordering::AcqRel);
-        let l = (&self.inner.list as *const skiplist::OrderedSkipList<KvEntry>);
+        let l = &self.inner.list as *const skiplist::OrderedSkipList<KvEntry>;
         unsafe {
             let l = (l as *mut skiplist::OrderedSkipList<KvEntry>)
                 .as_mut()
@@ -226,7 +217,7 @@ mod test {
 
     #[test]
     pub fn write_memtable() {
-        let (_, mut table, ver) = crate::test::init_table();
+        let (_, table, ver) = crate::test::init_table();
         let opt = GetOption::default();
 
         table

@@ -1,17 +1,12 @@
-use std::{
-    collections::HashSet,
-    ops::{Range, RangeBounds},
-    sync::Arc,
-};
+use std::{collections::HashSet, ops::RangeBounds, sync::Arc};
 
 use bytes::Bytes;
 
 use super::{GetOption, KvEntry, Memtable};
 use crate::{
-    iterator::{IteratorContext, ScanIter},
-    util::eq_filter::EqualFilter,
+    iterator::{EqualFilter, IteratorContext, ScanIter},
+    kv::kv_entry_ref_to_value,
     value::Value,
-    KvIterator,
 };
 use superslice::*;
 
@@ -45,7 +40,6 @@ impl Imemtable {
         let mut map = HashSet::new();
         let new_keys = keys
             .into_iter()
-            .rev()
             .filter(|item| {
                 if item.version() < reserved_version {
                     match map.get(&item.key) {
@@ -61,7 +55,6 @@ impl Imemtable {
             })
             .collect();
         keys = new_keys;
-        keys.reverse();
 
         Self {
             keys: Arc::new(keys),
@@ -76,8 +69,8 @@ impl Imemtable {
     pub fn min_max(&self) -> Option<(Bytes, Bytes)> {
         if self.keys.len() > 0 {
             Some((
-                self.keys.first().unwrap().key().clone(),
-                self.keys.last().unwrap().key().clone(),
+                self.keys.first().unwrap().key(),
+                self.keys.last().unwrap().key(),
             ))
         } else {
             None
@@ -107,7 +100,7 @@ impl Imemtable {
     pub fn get(&self, opt: &GetOption, key: Bytes) -> Option<Value> {
         let mut range = self.keys.equal_range_by(|entry| entry.key().cmp(&key));
 
-        if range.len() == 0 {
+        if range.is_empty() {
             return None;
         }
 
@@ -131,13 +124,13 @@ impl Imemtable {
     ) -> ScanIter<(Bytes, Value)> {
         use std::ops::Bound::*;
         let beg = match range.start_bound() {
-            Included(val) => self.keys.lower_bound_by(|entry| entry.key().cmp(&val)),
-            Excluded(val) => self.keys.upper_bound_by(|entry| entry.key().cmp(&val)),
+            Included(val) => self.keys.lower_bound_by(|entry| entry.key().cmp(val)),
+            Excluded(val) => self.keys.upper_bound_by(|entry| entry.key().cmp(val)),
             Unbounded => 0,
         };
         let end = match range.end_bound() {
-            Included(val) => self.keys.upper_bound_by(|entry| entry.key().cmp(&val)),
-            Excluded(val) => self.keys.lower_bound_by(|entry| entry.key().cmp(&val)),
+            Included(val) => self.keys.upper_bound_by(|entry| entry.key().cmp(val)),
+            Excluded(val) => self.keys.lower_bound_by(|entry| entry.key().cmp(val)),
             Unbounded => self.keys.len(),
         };
         let keys = self.keys.clone();
@@ -149,25 +142,18 @@ impl Imemtable {
                     slice
                         .iter()
                         .filter(move |entry| entry.version() <= snapshot_ver),
-                    |a: &&KvEntry, b: &&KvEntry| !a.equal_key(b),
                 )
-                .map(|entry| (entry.key(), Value::from_entry(entry))),
+                .map(kv_entry_ref_to_value),
             )
             .with(keys)
         } else {
-            ScanIter::new(
-                EqualFilter::new(slice.iter(), |a: &&KvEntry, b: &&KvEntry| !a.equal_key(b))
-                    .map(|entry| (entry.key(), Value::from_entry(entry))),
-            )
-            .with(keys)
+            ScanIter::new(EqualFilter::new(slice.iter()).map(kv_entry_ref_to_value)).with(keys)
         }
     }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::kv::WriteOption;
-
     use super::*;
 
     #[test]

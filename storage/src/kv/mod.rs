@@ -1,8 +1,8 @@
-use std::io::{self, Read};
+use std::io;
 
-use crate::{iterator::ScanIter, log::LogEntrySerializer, value::Value, GetOption, WriteOption};
+use crate::{iterator::EqualKey, log::LogEntrySerializer, value::Value, GetOption, WriteOption};
 use bitflags::bitflags;
-use byteorder::{ByteOrder, ReadBytesExt, WriteBytesExt, LE};
+use byteorder::{ReadBytesExt, WriteBytesExt, LE};
 use bytes::Bytes;
 
 #[derive(Debug)]
@@ -60,7 +60,7 @@ impl KvEntry {
         let mut flags = 0;
         if let Some(ttl) = ttl {
             flags |= Flags::TTL.bits;
-            flags = (ttl << 8) | flags;
+            flags |= ttl << 8;
         }
 
         Self {
@@ -113,7 +113,7 @@ impl KvEntry {
         let mut flags = Flags::EXTERN_VALUE.bits;
         if let Some(ttl) = ttl {
             flags |= Flags::TTL.bits;
-            flags = (ttl << 8) | flags;
+            flags |= ttl << 8;
         }
         let value = value_offset.to_le_bytes();
 
@@ -146,6 +146,24 @@ impl KvEntry {
     pub fn bytes(&self) -> u64 {
         self.key.len() as u64 + self.value.len() as u64 + 16
     }
+}
+
+impl EqualKey for KvEntry {
+    fn equal_key(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+impl EqualKey for &KvEntry {
+    fn equal_key(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+
+pub fn kv_entry_to_value(entry: KvEntry) -> (Bytes, Value) {
+    (entry.key(), Value::from_entry(&entry))
+}
+pub fn kv_entry_ref_to_value(entry: &KvEntry) -> (Bytes, Value) {
+    (entry.key(), Value::from_entry(entry))
 }
 
 #[derive(Debug, Default)]

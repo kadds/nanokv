@@ -1,7 +1,6 @@
 use std::{
     fs,
-    ops::{Bound, Range, RangeBounds},
-    sync::Arc,
+    ops::{Bound, RangeBounds},
 };
 
 use crate::{
@@ -14,7 +13,7 @@ use crate::{
 use self::raw_sst::RawSSTReader;
 
 use super::{
-    manifest::{FileMetaData, Version, VersionRef},
+    manifest::{FileMetaData, VersionRef, MAX_LEVEL},
     KvEntry,
 };
 
@@ -27,9 +26,14 @@ pub trait SSTWriter {
         I: Iterator<Item = &'a KvEntry>;
 }
 
+pub(crate) fn prepare_sst_dir(base: &str) {
+    for level in 0..MAX_LEVEL {
+        let parent = format!("{}/sst/{}", base, level);
+        let _ = fs::create_dir_all(parent).unwrap();
+    }
+}
+
 pub fn sst_name(base: &str, level: u32, seq: u64) -> String {
-    let parent = format!("{}/sst/{}", base, level);
-    let _ = fs::create_dir_all(parent);
     format!("{}/sst/{}/{}.sst", base, level, seq)
 }
 
@@ -74,8 +78,9 @@ impl<'a> SnapshotTable<'a> {
         let iter = self
             .version
             .level_n(0)
+            .rev()
             .filter(|file| file.min_ver <= self.snapshot.version())
-            .map(|file| RawSSTReader::new(&sst_name(&self.config.path, file.level, file.seq)));
+            .map(|file| self.cache.get_opened_sst(file.level, file.seq));
 
         for file_reader in iter {
             let value = file_reader.get(opt, key.clone());
@@ -108,7 +113,6 @@ impl<'a> SnapshotTable<'a> {
                 range.end_bound().cloned(),
             ));
         }
-
         ScanIter::new(MergedIter::new(iters))
     }
 }

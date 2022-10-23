@@ -27,7 +27,10 @@ impl Cache {
             .lock()
             .unwrap()
             .get_or_insert(seq, || {
-                Arc::new(RawSSTReader::new(&&sst_name(&self.config.path, level, seq)))
+                Arc::new(RawSSTReader::new(
+                    &sst_name(&self.config.path, level, seq),
+                    seq,
+                ))
             })
             .clone()
     }

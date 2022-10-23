@@ -2,12 +2,14 @@ use bytes::Bytes;
 
 use crate::{iterator::KvIteratorItem, kv::KvEntry};
 
+#[derive(Debug)]
 enum LazyValueRef {
     Inplace(Bytes),
     Extern(u64),
     Del,
 }
 
+#[derive(Debug)]
 pub struct Value {
     value: LazyValueRef,
     ver: u64,
@@ -32,12 +34,10 @@ impl Value {
     pub(crate) fn from_entry(entry: &KvEntry) -> Self {
         if entry.big_value() {
             todo!();
+        } else if entry.deleted() {
+            Self::new_deleted(entry.version())
         } else {
-            if entry.deleted() {
-                Self::new_deleted(entry.version())
-            } else {
-                Self::new(entry.value(), entry.version())
-            }
+            Self::new(entry.value(), entry.version())
         }
     }
 }
@@ -47,10 +47,9 @@ impl Value {
         match &self.value {
             LazyValueRef::Del => Bytes::new(),
             LazyValueRef::Inplace(val) => val.clone(),
-            LazyValueRef::Extern(offset) => {
-                let data = Bytes::new();
+            LazyValueRef::Extern(_offset) => {
                 // TODO: load vlog value
-                data
+                Bytes::new()
             }
         }
     }

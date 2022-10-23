@@ -6,6 +6,13 @@ use std::io::Read;
 #[derive(Deserialize, Serialize, Debug)]
 pub struct Config {
     pub path: String,
+    pub no_wal: bool,
+}
+
+impl Config {
+    pub fn set_no_wal(&mut self, no_wal: bool) {
+        self.no_wal = no_wal;
+    }
 }
 
 pub type ConfigRef = &'static Config;
@@ -17,6 +24,7 @@ pub fn load_config() -> Box<Config> {
 pub fn test_config() -> Box<Config> {
     let cfg = Config {
         path: "/tmp/nanokv/".to_owned(),
+        no_wal: false,
     };
     cfg.into()
 }
@@ -24,6 +32,7 @@ pub fn test_config() -> Box<Config> {
 pub fn current_config() -> Box<Config> {
     let cfg = Config {
         path: "./nanokv_data/".to_owned(),
+        no_wal: false,
     };
     cfg.into()
 }

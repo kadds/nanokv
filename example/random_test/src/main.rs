@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use ::storage::*;
 use bytes::Bytes;
@@ -25,23 +25,31 @@ fn rand_value() -> Bytes {
 
 fn is_deleted() -> bool {
     let mut rng = rand::thread_rng();
-    rng.gen_bool(0.1)
+    rng.gen_bool(0.07)
+}
+
+fn repeated() -> bool {
+    let mut rng = rand::thread_rng();
+    rng.gen_bool(0.12)
 }
 
 fn main() {
     env_logger::init();
-    let config = config::current_config();
+    let mut config = config::current_config();
+    config.set_no_wal(true);
+
     let config = Box::leak(config);
 
     let mut ins = Instance::new(config);
 
-    let total_test: usize = 1_000_00;
+    let total_test: usize = 100_000;
 
-    let mut exist_key = HashSet::<String>::new();
+    let mut exist_keys = HashSet::<String>::new();
+    let mut del_keys = HashSet::<String>::new();
 
     for i in 0..total_test {
-        if is_deleted() && exist_key.len() > 0 {
-            let del_key = exist_key.iter().next().unwrap().clone();
+        if is_deleted() && !exist_keys.is_empty() {
+            let del_key = exist_keys.iter().next().unwrap().clone();
 
             // make sure del_key exist
             ins.mut_storage()
@@ -52,11 +60,13 @@ fn main() {
                 .del(&WriteOption::default(), del_key.clone())
                 .unwrap();
 
-            exist_key.remove(&del_key);
+            exist_keys.remove(&del_key);
+
+            del_keys.insert(del_key.clone());
         } else {
             let key = loop {
                 let key = rand_key();
-                if exist_key.insert(key.clone()) {
+                if del_keys.get(&key).is_none() && exist_keys.insert(key.clone()) {
                     break key;
                 }
             };
@@ -64,8 +74,15 @@ fn main() {
             let value = rand_value();
 
             ins.mut_storage()
-                .set(&WriteOption::default(), key, value)
+                .set(&WriteOption::default(), key.clone(), value.clone())
                 .unwrap();
+
+            if repeated() {
+                let value = rand_value();
+                ins.mut_storage()
+                    .set(&WriteOption::default(), key, value)
+                    .unwrap();
+            }
         }
 
         let p = i / (total_test / 100);
@@ -75,11 +92,42 @@ fn main() {
         }
     }
 
+    for key in &exist_keys {
+        if ins
+            .mut_storage()
+            .get(&GetOption::default(), key.clone())
+            .is_none()
+        {
+            ins.mut_storage()
+                .get(&GetOption::default(), key.clone())
+                .unwrap();
+        }
+    }
+
     let iter = ins.mut_storage().scan(&GetOption::default(), ..);
 
     println!(
         "scan all keys in db {} should be {}",
         iter.count(),
-        exist_key.len()
+        exist_keys.len()
     );
+
+    let iter = ins.mut_storage().scan(&GetOption::default(), ..);
+    let mut v: Vec<String> = exist_keys.into_iter().collect();
+    v.sort();
+
+    for (idx, val) in iter.enumerate() {
+        let val = unsafe { String::from_utf8_unchecked(val.0.into()) };
+        if val != v[idx] {
+            if del_keys.get(&val).is_some() {
+                println!("somehow {} key exists", val);
+            }
+            println!(
+                "corruption at index {} read key {} expect key {}",
+                idx, val, v[idx]
+            );
+            ins.storage().get(&GetOption::default(), val).unwrap();
+            break;
+        }
+    }
 }

@@ -1,7 +1,5 @@
 use std::{
-    borrow::Cow,
-    cell::RefCell,
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet, LinkedList},
+    collections::{BTreeMap, LinkedList},
     fs::{self, File},
     io::{Read, Write},
     sync::{Arc, Mutex},
@@ -10,15 +8,12 @@ use std::{
 use ::log::info;
 use byteorder::{ReadBytesExt, WriteBytesExt, LE};
 use bytes::Bytes;
-use lru::LruCache;
 
 use crate::{
     log::{self, LogEntrySerializer, LogWriter},
     snapshot::Snapshot,
     ConfigRef,
 };
-
-use super::sst::{raw_sst::RawSSTReader, sst_name};
 
 #[derive(Debug, Clone)]
 pub struct Version {
@@ -38,7 +33,7 @@ impl Default for Version {
 }
 
 impl Version {
-    pub fn level_n(&self, n: usize) -> impl Iterator<Item = &FileMetaData> {
+    pub fn level_n(&self, n: usize) -> impl DoubleEndedIterator<Item = &FileMetaData> {
         self.sst_files[n].iter().map(|v| v.as_ref())
     }
 }
@@ -296,13 +291,13 @@ impl VersionSet {
                 }
             }
             VersionEdit::VersionChanged(ver) => {
-                self.last_version = ver.clone();
+                self.last_version = *ver;
             }
             VersionEdit::SSTSequenceChanged(seq) => {
-                self.last_sst_seq = seq.clone();
+                self.last_sst_seq = *seq;
             }
             VersionEdit::ManifestSequenceChanged(seq) => {
-                self.last_manifest_seq = seq.clone();
+                self.last_manifest_seq = *seq;
             }
             VersionEdit::Snapshot(ver) => self.current.push_front(ver.clone()),
         }
@@ -322,32 +317,25 @@ impl VersionSet {
 
     pub fn current_snapshot_version(&mut self) -> u64 {
         let ver = self.last_version;
-        let mut insert = true;
-        match self.snapshot_versions.get_mut(&ver) {
-            Some(v) => {
-                *v += 1;
-                insert = false;
-            }
-            None => (),
-        };
-        if insert {
-            self.snapshot_versions.insert(ver, 1);
-        }
+        self.snapshot_versions
+            .entry(ver)
+            .and_modify(|val| *val += 1)
+            .or_insert(1);
         ver
     }
 
     pub fn release_snapshot_version(&mut self, ver: u64) {
         let mut del = false;
-        match self.snapshot_versions.get_mut(&ver) {
-            Some(v) => {
-                if *v != 0 {
-                    *v -= 1;
-                } else {
+        self.snapshot_versions
+            .entry(ver)
+            .and_modify(|val| {
+                *val -= 1;
+                if *val == 0 {
                     del = true;
                 }
-            }
-            None => return,
-        };
+            })
+            .or_default();
+
         if del {
             self.snapshot_versions.remove(&ver);
         }
@@ -355,7 +343,7 @@ impl VersionSet {
 }
 
 pub fn manifest_path(base: &str) -> String {
-    return format!("{}/manifest/", base);
+    format!("{}/manifest/", base)
 }
 
 pub const MAX_LEVEL: u32 = 8;
@@ -414,7 +402,7 @@ impl Manifest {
             .unwrap()
             .write(seq.to_string().as_bytes());
 
-        let _ = fs::rename(&self.tmp_filename, &self.current_filename).unwrap();
+        fs::rename(&self.tmp_filename, &self.current_filename).unwrap();
     }
 
     pub fn current_log_sequence(&self) -> Option<u64> {
@@ -432,12 +420,12 @@ impl Manifest {
         *self.version_set.lock().unwrap() = final_state;
     }
 
-    fn remove_unused_wal(&self, except_seq: u64) {}
+    fn remove_unused_wal(&self, _except_seq: u64) {}
 }
 
 impl Manifest {
     fn commit(&self, edit: &VersionEdit) {
-        self.wal.lock().unwrap().append(&edit);
+        self.wal.lock().unwrap().append(edit);
         self.wal.lock().unwrap().sync();
     }
 
@@ -540,7 +528,7 @@ impl Manifest {
         let ver = self.version_set.lock().unwrap();
         ver.snapshot_versions
             .iter()
-            .map(|(k, v)| *k)
+            .map(|(k, _v)| *k)
             .next()
             .unwrap_or(u64::MAX)
     }
