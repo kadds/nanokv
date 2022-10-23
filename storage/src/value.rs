@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-use crate::kv::KvEntry;
+use crate::{iterator::KvIteratorItem, kv::KvEntry};
 
 enum LazyValueRef {
     Inplace(Bytes),
@@ -62,5 +62,15 @@ impl Value {
     }
     pub fn version(&self) -> u64 {
         self.ver
+    }
+}
+
+impl KvIteratorItem for (Bytes, Value) {
+    fn key(&self) -> &Bytes {
+        &self.0
+    }
+
+    fn version(&self) -> u64 {
+        self.1.version()
     }
 }

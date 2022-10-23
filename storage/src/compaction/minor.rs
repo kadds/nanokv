@@ -8,7 +8,7 @@ use log::info;
 
 use crate::{
     kv::{
-        manifest::Manifest,
+        manifest::{FileMetaData, Manifest},
         sst::{self, sst_name, SSTWriter},
         Imemtable,
     },
@@ -25,7 +25,7 @@ pub struct MinorSerializer {
     thread: UnsafeCell<Option<JoinHandle<()>>>,
     rx: mpsc::Receiver<Option<Arc<Imemtable>>>,
     tx: mpsc::Sender<Option<Arc<Imemtable>>>,
-    commit_tx: mpsc::SyncSender<Arc<Imemtable>>,
+    commit_tx: mpsc::SyncSender<(Arc<Imemtable>, Arc<FileMetaData>)>,
     manifest: Arc<Manifest>,
 }
 
@@ -33,7 +33,7 @@ impl MinorSerializer {
     pub fn new(
         conf: ConfigRef,
         manifest: Arc<Manifest>,
-        commit_tx: mpsc::SyncSender<Arc<Imemtable>>,
+        commit_tx: mpsc::SyncSender<(Arc<Imemtable>, Arc<FileMetaData>)>,
     ) -> Arc<Self> {
         let (tx, rx) = mpsc::channel();
         let this = Arc::new(Self {
@@ -59,18 +59,18 @@ impl MinorSerializer {
                 Some(table) => table,
                 None => break,
             };
-            {
+            let meta = {
                 let seq = table.seq();
                 let iter = table.entry_iter().filter(|entry| !entry.deleted());
                 let mut sst =
                     sst::raw_sst::RawSSTWriter::new(&sst_name(&conf.path, 0, table.seq()));
 
                 let meta = sst.write(0, seq, iter);
-                self.manifest.add_sst(Arc::new(meta));
 
                 info!("sst {} done", seq);
-            }
-            self.commit_tx.send(table).unwrap();
+                meta
+            };
+            self.commit_tx.send((table, Arc::new(meta))).unwrap();
         }
     }
 

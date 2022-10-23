@@ -1,6 +1,8 @@
 use std::{
-    collections::LinkedList,
-    fs::File,
+    borrow::Cow,
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, LinkedList},
+    fs::{self, File},
     io::{Read, Write},
     sync::{Arc, Mutex},
 };
@@ -8,6 +10,7 @@ use std::{
 use ::log::info;
 use byteorder::{ReadBytesExt, WriteBytesExt, LE};
 use bytes::Bytes;
+use lru::LruCache;
 
 use crate::{
     log::{self, LogEntrySerializer, LogWriter},
@@ -15,8 +18,11 @@ use crate::{
     ConfigRef,
 };
 
+use super::sst::{raw_sst::RawSSTReader, sst_name};
+
 #[derive(Debug, Clone)]
 pub struct Version {
+    id: u64,
     sst_files: Vec<Vec<Arc<FileMetaData>>>,
 }
 
@@ -27,7 +33,13 @@ impl Default for Version {
         let mut sst_files = Vec::new();
         sst_files.resize((MAX_LEVEL + 1) as usize, Vec::new());
 
-        Self { sst_files }
+        Self { id: 0, sst_files }
+    }
+}
+
+impl Version {
+    pub fn level_n(&self, n: usize) -> impl Iterator<Item = &FileMetaData> {
+        self.sst_files[n].iter().map(|v| v.as_ref())
     }
 }
 
@@ -256,64 +268,94 @@ impl LogEntrySerializer for ManifestLogSerializer {
 #[derive(Debug, Default)]
 pub struct VersionSet {
     current: LinkedList<VersionRef>,
+    version: Version,
+
     last_version: u64,
     last_sst_seq: u64,
     last_manifest_seq: u64,
+    snapshot_versions: BTreeMap<u64, usize>,
 }
 
-impl VersionSet {}
-
 impl VersionSet {
-    pub fn add(&mut self, edit: VersionEdit) {
+    pub fn add(&mut self, edit: &VersionEdit) {
         match edit {
             VersionEdit::SSTAppended(file) => {
                 // TODO: binary insert
-                let mut ver = self.new_current_version();
-                ver.sst_files[file.level as usize].push(file);
-                self.append_new_version(ver);
+                // version.sst_files[file.level as usize].binary_search_by(|f| {f.min < file.min});
+                self.version.sst_files[file.level as usize].push(file.clone());
             }
             VersionEdit::SSTRemove(seq) => {
-                let mut ver = self.new_current_version();
-
-                for level_files in &mut ver.sst_files {
+                for level_files in &mut self.version.sst_files {
                     if let Some((idx, _)) = level_files
                         .iter()
                         .enumerate()
-                        .find(|(_, val)| val.seq == seq)
+                        .find(|(_, val)| val.seq == *seq)
                     {
                         level_files.remove(idx);
                     }
                 }
-
-                self.append_new_version(ver);
             }
             VersionEdit::VersionChanged(ver) => {
-                self.last_version = ver;
+                self.last_version = ver.clone();
             }
             VersionEdit::SSTSequenceChanged(seq) => {
-                self.last_sst_seq = seq;
+                self.last_sst_seq = seq.clone();
             }
             VersionEdit::ManifestSequenceChanged(seq) => {
-                self.last_manifest_seq = seq;
+                self.last_manifest_seq = seq.clone();
             }
-            VersionEdit::Snapshot(ver) => self.current.push_front(ver),
+            VersionEdit::Snapshot(ver) => self.current.push_front(ver.clone()),
         }
     }
 
-    pub fn current(&self) -> VersionRef {
-        self.current.front().map(|v| v.clone()).unwrap_or_default()
+    pub fn current(&mut self) -> VersionRef {
+        let ver = Arc::new(self.version.clone());
+        self.version.id += 1;
+
+        self.current.push_front(ver.clone());
+        ver
     }
 
-    fn append_new_version(&mut self, ver: Version) {
-        self.current.push_front(Arc::new(ver));
+    pub fn detach_version(&self, ver: VersionRef) {
+        self.current.iter().find(|v| v.id == ver.id);
     }
 
-    fn new_current_version(&self) -> Version {
-        self.current
-            .front()
-            .map(|v| v.as_ref().clone())
-            .unwrap_or_default()
+    pub fn current_snapshot_version(&mut self) -> u64 {
+        let ver = self.last_version;
+        let mut insert = true;
+        match self.snapshot_versions.get_mut(&ver) {
+            Some(v) => {
+                *v += 1;
+                insert = false;
+            }
+            None => (),
+        };
+        if insert {
+            self.snapshot_versions.insert(ver, 1);
+        }
+        ver
     }
+
+    pub fn release_snapshot_version(&mut self, ver: u64) {
+        let mut del = false;
+        match self.snapshot_versions.get_mut(&ver) {
+            Some(v) => {
+                if *v != 0 {
+                    *v -= 1;
+                } else {
+                    del = true;
+                }
+            }
+            None => return,
+        };
+        if del {
+            self.snapshot_versions.remove(&ver);
+        }
+    }
+}
+
+pub fn manifest_path(base: &str) -> String {
+    return format!("{}/manifest/", base);
 }
 
 pub const MAX_LEVEL: u32 = 8;
@@ -322,6 +364,7 @@ pub struct Manifest {
     config: ConfigRef,
     version_set: Mutex<VersionSet>,
     current_filename: String,
+    tmp_filename: String,
     wal: Mutex<LogWriter<VersionEdit, ManifestLogSerializer>>,
 }
 
@@ -329,23 +372,31 @@ impl Manifest {
     pub fn new(config: ConfigRef) -> Self {
         // replay version log
         let version_set = Mutex::new(VersionSet::default());
-        let current_filename = format!("{}/manifest/current", config.path);
+        let path = manifest_path(&config.path);
+        fs::create_dir_all(&path).unwrap();
+
+        let current_filename = format!("{}current", path);
+        let tmp_filename = format!("{}current_tmp", path);
+
         let seq = Self::load_current_log_sequence(&current_filename).unwrap_or_default();
-        let wal_path = format!("{}/manifest/", config.path);
 
         let mut this = Self {
             config,
             version_set,
             current_filename,
+            tmp_filename,
             wal: Mutex::new(LogWriter::new(
                 ManifestLogSerializer::default(),
                 seq + 1,
-                wal_path,
+                path,
             )),
         };
 
         this.restore_from_wal(seq);
         this.save_current_log();
+
+        this.version_set.lock().unwrap().last_manifest_seq = seq + 2;
+        this.remove_unused_wal(seq + 1);
 
         // TODO: reload global version from wal
         this
@@ -359,9 +410,11 @@ impl Manifest {
 
     pub fn save_current_log(&self) {
         let seq = self.wal.lock().unwrap().seq();
-        let _ = File::create(&self.current_filename)
+        let _ = File::create(&self.tmp_filename)
             .unwrap()
             .write(seq.to_string().as_bytes());
+
+        let _ = fs::rename(&self.tmp_filename, &self.current_filename).unwrap();
     }
 
     pub fn current_log_sequence(&self) -> Option<u64> {
@@ -369,28 +422,31 @@ impl Manifest {
     }
 
     fn restore_from_wal(&mut self, seq: u64) {
-        let path = format!("{}/manifest", self.config.path);
+        let path = manifest_path(&self.config.path);
         let s = ManifestLogSerializer::default();
         let mut replayer = log::LogReplayer::new(s, seq, path);
         let final_state = replayer.execute(VersionSet::default(), |state, edit| {
-            state.add(edit);
+            state.add(&edit);
         });
-        info!("load manifest {:?}", final_state);
+        info!("load manifest {} {:?}", seq, final_state);
         *self.version_set.lock().unwrap() = final_state;
     }
+
+    fn remove_unused_wal(&self, except_seq: u64) {}
 }
 
 impl Manifest {
     fn commit(&self, edit: &VersionEdit) {
         self.wal.lock().unwrap().append(&edit);
+        self.wal.lock().unwrap().sync();
     }
 
-    fn make_snapshot(&self) {
+    fn rotate(&self) {
         let mut wal = self.wal.lock().unwrap();
         let old_seq = wal.seq();
         let seq = self.allocate_manifest_sequence();
 
-        let ver = self.version_set.lock().unwrap();
+        let mut ver = self.version_set.lock().unwrap();
 
         wal.append(&VersionEdit::VersionChanged(ver.last_version));
         wal.append(&VersionEdit::ManifestSequenceChanged(ver.last_manifest_seq));
@@ -400,12 +456,20 @@ impl Manifest {
             wal.rotate(seq);
             // new wal file
             wal.append(&VersionEdit::Snapshot(ver.current()));
-            wal.remove(old_seq);
+            wal.append(&VersionEdit::VersionChanged(ver.last_version));
+            wal.append(&VersionEdit::ManifestSequenceChanged(ver.last_manifest_seq));
+            wal.append(&VersionEdit::SSTSequenceChanged(ver.last_sst_seq));
+
+            wal.sync();
         }
+        let _ = File::create(&self.current_filename)
+            .unwrap()
+            .write(seq.to_string().as_bytes());
+        wal.remove(old_seq);
     }
 
     pub fn flush(&self) {
-        self.make_snapshot();
+        self.rotate();
     }
 
     pub fn allocate_version(&self, num: u64) -> u64 {
@@ -423,9 +487,10 @@ impl Manifest {
     pub fn allocate_sst_sequence(&self) -> u64 {
         let mut ver = self.version_set.lock().unwrap();
         let return_seq = ver.last_sst_seq;
-        ver.last_sst_seq += 1;
+        let edit = VersionEdit::SSTSequenceChanged(ver.last_sst_seq + 1);
+        self.commit(&edit);
 
-        self.commit(&VersionEdit::SSTSequenceChanged(ver.last_sst_seq));
+        ver.add(&edit);
         return_seq
     }
 
@@ -444,15 +509,56 @@ impl Manifest {
     pub fn add_sst(&self, meta: Arc<FileMetaData>) {
         let edit = VersionEdit::SSTAppended(meta);
         self.commit(&edit);
+        self.version_set.lock().unwrap().add(&edit);
+    }
+
+    pub fn remove_sst(&self, seq: u64) {
+        let edit = VersionEdit::SSTRemove(seq);
+        self.commit(&edit);
+        self.version_set.lock().unwrap().add(&edit);
     }
 
     pub fn current(&self) -> VersionRef {
-        let ver = self.version_set.lock().unwrap();
+        let mut ver = self.version_set.lock().unwrap();
         ver.current()
     }
 
-    pub fn snapshot(&self) -> Snapshot {
+    pub fn new_snapshot<'a>(&'a self) -> SnapshotGuard<'a> {
+        let mut ver = self.version_set.lock().unwrap();
+        SnapshotGuard {
+            snapshot: Snapshot::new(ver.current_snapshot_version()),
+            manifest: self,
+        }
+    }
+
+    fn release_snapshot(&self, snapshot_version: u64) {
+        let mut ver = self.version_set.lock().unwrap();
+        ver.release_snapshot_version(snapshot_version);
+    }
+
+    pub fn oldest_snapshot_version(&self) -> u64 {
         let ver = self.version_set.lock().unwrap();
-        Snapshot::new(ver.last_version, ver.current())
+        ver.snapshot_versions
+            .iter()
+            .map(|(k, v)| *k)
+            .next()
+            .unwrap_or(u64::MAX)
+    }
+}
+
+pub struct SnapshotGuard<'a> {
+    snapshot: Snapshot,
+    manifest: &'a Manifest,
+}
+
+impl<'a> SnapshotGuard<'a> {
+    pub fn get(&self) -> Snapshot {
+        self.snapshot.clone()
+    }
+}
+
+impl<'a> Drop for SnapshotGuard<'a> {
+    fn drop(&mut self) {
+        self.manifest.release_snapshot(self.snapshot.version())
     }
 }

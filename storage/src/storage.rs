@@ -1,6 +1,8 @@
 use std::{
     collections::VecDeque,
+    fs,
     mem::swap,
+    ops::{Range, RangeBounds},
     sync::{mpsc, Arc},
     time::Duration,
 };
@@ -9,17 +11,18 @@ use bytes::Bytes;
 use log::info;
 
 use crate::{
+    cache::Cache,
     compaction::minor::MinorSerializer,
-    kv::{sst::SnapshotTable},
+    iterator::{MergedIter, ScanIter},
+    kv::{manifest::FileMetaData, sst::SnapshotTable},
     log::LogReplayer,
     snapshot::Snapshot,
-    KvIterator, GetOption, WriteOption,
+    GetOption, KvIterator, WriteOption,
 };
 use crate::{
     compaction::CompactSerializer,
     kv::{
-        manifest::Manifest, Imemtable, KVReader, KVWriter, KvEntry, KvEntryLogSerializer, Memtable,
-        SetError, SetResult,
+        manifest::Manifest, Imemtable, KvEntry, KvEntryLogSerializer, Memtable, SetError, SetResult,
     },
     log::LogWriter,
     value::Value,
@@ -55,9 +58,8 @@ impl Imemtables {
     }
 }
 
-impl<'a> KVReader<'a> for Imemtables {
-    fn get<K: Into<Bytes>>(&self, opt: &GetOption, key: K) -> Option<Value> {
-        let key = key.into();
+impl Imemtables {
+    fn get(&self, opt: &GetOption, key: Bytes) -> Option<Value> {
         for table in self.imemtables.iter().rev() {
             if let Some(value) = table.get(opt, key.clone()) {
                 return Some(value);
@@ -66,18 +68,17 @@ impl<'a> KVReader<'a> for Imemtables {
         None
     }
 
-    fn scan<K: Into<Bytes>>(
-        &'a self,
+    fn scan(
+        &self,
         opt: &GetOption,
-        beg: K,
-        end: K,
-    ) -> Box<dyn KvIterator<Item = (Bytes, Value)> + 'a> {
-        let beg = beg.into();
-        let end = end.into();
+        range: impl RangeBounds<Bytes> + Clone,
+    ) -> ScanIter<(Bytes, Value)> {
+        let mut iters = Vec::new();
         for table in self.imemtables.iter().rev() {
-            // table.scan(opt, key.clone());
+            iters.push(table.scan(opt, range.clone()));
         }
-        todo!()
+
+        ScanIter::new(MergedIter::new(iters))
     }
 }
 
@@ -86,17 +87,29 @@ pub struct Storage {
     imemtables: Imemtables,
     wal: LogWriter<KvEntry, KvEntryLogSerializer>,
     serializer: Arc<MinorSerializer>,
-    commit_rx: mpsc::Receiver<Arc<Imemtable>>,
+    commit_rx: mpsc::Receiver<(Arc<Imemtable>, Arc<FileMetaData>)>,
     manifest: Arc<Manifest>,
+    config: ConfigRef,
+    cache: Cache,
+}
+
+pub struct Scanner {}
+
+impl Scanner {
+    fn scanner(&self) {}
+
+    fn iter(&self) {}
 }
 
 impl Storage {
     pub fn new(config: ConfigRef, manifest: Arc<Manifest>) -> Self {
         let mut imemtables = Imemtables::new(config);
         let (commit_tx, commit_rx) = mpsc::sync_channel(20);
-        let wal_path = format!("{}/wal", config.path);
+        let wal_path = format!("{}/wal/", config.path);
+        fs::create_dir_all(&wal_path).unwrap();
+
         let log_serializer = KvEntryLogSerializer::default();
-        let serializer = MinorSerializer::new(config, manifest.clone(), commit_tx);
+        let serializer = MinorSerializer::new(config.clone(), manifest.clone(), commit_tx);
 
         let mut restore_seq = manifest.last_sst_sequence();
         if restore_seq > 0 {
@@ -108,7 +121,7 @@ impl Storage {
                     state.set(&WriteOption::default(), entry).unwrap()
                 });
 
-            let imm: Imemtable = memtable.into();
+            let imm: Imemtable = Imemtable::new(memtable, u64::MAX);
             let latest_version = imm.min_max_ver().unwrap_or_default().1 + 1;
 
             manifest.set_latest_version(latest_version);
@@ -132,6 +145,8 @@ impl Storage {
             serializer,
             commit_rx,
             manifest,
+            cache: Cache::new(config.clone()),
+            config,
         };
 
         sf
@@ -157,14 +172,48 @@ impl Storage {
             return Some(value);
         }
 
-        let snapshot: Snapshot = self.manifest.snapshot();
-        if let Some(value) = SnapshotTable::from(snapshot).get(opt, key.clone()) {}
+        let snapshot_guard = self.manifest.new_snapshot();
+        let sn = if let Some(snapshot) = opt.snapshot() {
+            snapshot.clone()
+        } else {
+            snapshot_guard.get()
+        };
+
+        if let Some(value) =
+            SnapshotTable::new(sn, self.manifest.current(), self.config, &self.cache)
+                .get(opt, key.clone())
+        {
+            if value.deleted() {
+                return None;
+            }
+            return Some(value);
+        }
 
         None
     }
 
-    pub fn scan<K: Into<Bytes>>(&self, opt: &GetOption, beg: K, end: K) -> Box<dyn KvIterator<Item = Value>> {
-        todo!()
+    pub fn scan(
+        &self,
+        opt: &GetOption,
+        range: impl RangeBounds<Bytes> + Clone,
+    ) -> ScanIter<(Bytes, Value)> {
+        let mut iters = Vec::new();
+        iters.push(self.memtable.scan(opt, range.clone()));
+        iters.push(self.imemtables.scan(opt, range.clone()));
+
+        let snapshot_guard = self.manifest.new_snapshot();
+        let sn = if let Some(snapshot) = opt.snapshot() {
+            snapshot.clone()
+        } else {
+            snapshot_guard.get()
+        };
+
+        iters.push(
+            SnapshotTable::new(sn, self.manifest.current(), self.config, &self.cache)
+                .scan(opt, range.clone()),
+        );
+
+        ScanIter::new(MergedIter::new(iters).filter(|(key, value)| !value.deleted()))
     }
 
     pub fn set<K: Into<Bytes>>(
@@ -232,12 +281,16 @@ impl Storage {
         swap(&mut memtable, &mut self.memtable);
 
         self.wal.rotate(new_seq);
-        let table = self.imemtables.push(memtable.into());
+        let table = self.imemtables.push(Imemtable::new(
+            memtable,
+            self.manifest.oldest_snapshot_version(),
+        ));
         self.serializer.compact_async(table);
 
-        while let Ok(table) = self.commit_rx.try_recv() {
+        while let Ok((table, meta)) = self.commit_rx.try_recv() {
             self.wal.remove(table.seq());
             self.imemtables.commit(table);
+            self.manifest.add_sst(meta);
         }
     }
 
@@ -247,14 +300,18 @@ impl Storage {
             let mut memtable = Memtable::new(0);
             swap(&mut memtable, &mut self.memtable);
 
-            let table = self.imemtables.push(memtable.into());
+            let table = self.imemtables.push(Imemtable::new(
+                memtable,
+                self.manifest.oldest_snapshot_version(),
+            ));
             self.serializer.compact_async(table);
         }
 
         while !self.imemtables.empty() {
-            if let Ok(table) = self.commit_rx.recv() {
+            if let Ok((table, meta)) = self.commit_rx.recv() {
                 self.wal.remove(table.seq());
                 self.imemtables.commit(table);
+                self.manifest.add_sst(meta);
             } else {
                 panic!("");
             }

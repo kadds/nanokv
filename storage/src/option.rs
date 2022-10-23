@@ -1,11 +1,10 @@
 use crate::snapshot::Snapshot;
 
-
-
 #[derive(Debug, Default)]
 pub struct GetOption {
     must_fetch_value: bool,
     snapshot: Option<Snapshot>,
+    fetch_delete: bool,
 }
 
 impl GetOption {
@@ -22,6 +21,11 @@ impl GetOption {
     pub fn snapshot(&self) -> Option<&Snapshot> {
         self.snapshot.as_ref()
     }
+
+    pub fn set_fetch_delete(mut self, fetch: bool) -> Self {
+        self.fetch_delete = fetch;
+        self
+    }
 }
 
 impl GetOption {
@@ -29,6 +33,7 @@ impl GetOption {
         Self {
             must_fetch_value: false,
             snapshot: Some(snapshot.into()),
+            fetch_delete: false,
         }
     }
 }

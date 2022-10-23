@@ -1,226 +1,238 @@
+use std::ops::{Bound, Range, RangeBounds};
+use std::rc::Rc;
+use std::sync::atomic::AtomicU64;
+use std::sync::Arc;
+
 use bytes::Bytes;
 
-use super::{GetOption, KVReader, KVWriter, KvEntry, SetResult, WriteOption};
-use crate::iterator::Iter;
+use super::{GetOption, Imemtable, KvEntry, SetResult, WriteOption};
+use crate::iterator::{IteratorContext, ScanIter};
 use crate::util::eq_filter::EqualFilter;
 use crate::value::Value;
-use crate::KvIterator;
+
+#[derive(Debug, Default)]
+struct MeltableInner {
+    list: skiplist::OrderedSkipList<KvEntry>,
+}
+
+impl IteratorContext for MeltableInner {
+    fn release(&mut self) {}
+}
 
 pub struct Memtable {
-    list: skiplist::OrderedSkipList<KvEntry>,
+    inner: Arc<MeltableInner>,
+
     seq: u64,
 
-    total_bytes: u64,
-    min_ver: u64,
+    total_bytes: AtomicU64,
+    min_ver: AtomicU64,
 }
 
 impl Memtable {
     pub fn new(seq: u64) -> Self {
         Self {
-            list: skiplist::OrderedSkipList::new(),
-            total_bytes: 0,
+            inner: Arc::new(MeltableInner::default()),
             seq,
-            min_ver: 0,
+            total_bytes: AtomicU64::new(0),
+            min_ver: AtomicU64::new(0),
         }
     }
 
-    pub fn into_iter<'a>(self) -> Box<dyn Iterator<Item = KvEntry>> {
-        Box::new(EqualFilter::new(
-            self.list.into_iter(),
-            |a: &KvEntry, b: &KvEntry| !a.equal_key(b),
-        ))
+    pub fn iter<'a>(&'a self) -> impl Iterator<Item = &'a KvEntry> {
+        unsafe {
+            core::mem::transmute::<_, skiplist::ordered_skiplist::Iter<'a, _>>(
+                self.inner.clone().list.iter(),
+            )
+        }
     }
 
     pub fn full(&self) -> bool {
-        self.list.len() >= 1024 * 16 || self.total_bytes > 1024 * 1024 * 10
+        self.inner.list.len() >= 1024 * 16
+            || self.total_bytes.load(std::sync::atomic::Ordering::Relaxed) > 1024 * 1024 * 10
     }
 
     pub fn seq(&self) -> u64 {
         self.seq
     }
     pub fn len(&self) -> usize {
-        self.list.len()
+        self.inner.list.len()
     }
 }
 
-impl<'a> KVReader<'a> for Memtable {
-    fn get<K: Into<Bytes>>(&self, opt: &GetOption, key: K) -> Option<Value> {
-        let key = key.into();
-
+impl Memtable {
+    pub fn get(&self, opt: &GetOption, key: Bytes) -> Option<Value> {
         use std::ops::Bound::Included;
-        let mut iter = self.list.range(
+        let mut iter = self.inner.list.range(
             Included(&KvEntry::from_search(key.to_owned(), u64::MAX)),
             Included(&KvEntry::from_search(key.to_owned(), 0)),
         );
         if let Some(snapshot) = opt.snapshot() {
             // snapshot get
             return iter
+                .filter(|entry| entry.key == key)
                 .find(|entry| entry.ver <= snapshot.version())
                 .map(Value::from_entry);
+        } else {
+            if let Some(entry) = iter.next() {
+                if entry.key == key {
+                    return Some(Value::from_entry(entry));
+                }
+            }
         }
 
-        if let Some(entry) = iter.next() {
-            return Some(Value::from_entry(entry));
-        }
         None
     }
 
-    fn scan<K: Into<Bytes>>(
-        &'a self,
+    pub fn scan(
+        &self,
         opt: &GetOption,
-        beg: K,
-        end: K,
-    ) -> Box<dyn KvIterator<Item = (Bytes, Value)> + 'a> {
+        range: impl RangeBounds<Bytes> + Clone,
+    ) -> ScanIter<(Bytes, Value)> {
         use std::ops::Bound::*;
-        let beg = beg.into();
-        let end = end.into();
-        let beg_len = beg.len();
-        let end_len = end.len();
-        let beg_entry = KvEntry::from_search(beg, u64::MAX);
-        let end_entry = KvEntry::from_search(end, 0);
+        let beg = match range.start_bound() {
+            Included(val) => Included(KvEntry::from_search(val.to_owned(), u64::MAX)),
+            Excluded(val) => Excluded(KvEntry::from_search(val.to_owned(), 0)),
+            Unbounded => Unbounded,
+        };
+        let end = match range.end_bound() {
+            Included(val) => Included(KvEntry::from_search(val.clone(), 0)),
+            Excluded(val) => Excluded(KvEntry::from_search(val.clone(), u64::MAX)),
+            Unbounded => Unbounded,
+        };
 
-        let iter = if beg_len == 0 && end_len == 0 {
-            self.list.iter()
-        } else {
-            self.list.range(
-                if beg_len == 0 {
-                    Unbounded
-                } else {
-                    Included(&beg_entry)
-                },
-                if end_len == 0 {
-                    Unbounded
-                } else {
-                    Included(&end_entry)
-                },
+        let beg = map_bound(&beg);
+        let end = map_bound(&end);
+
+        let inner = self.inner.clone();
+
+        let iter = unsafe {
+            core::mem::transmute::<_, skiplist::ordered_skiplist::Iter<'static, KvEntry>>(
+                inner.list.range(beg, end),
             )
         };
-        Box::new(Iter::from(
-            EqualFilter::new(iter, |a: &&KvEntry, b: &&KvEntry| !a.equal_key(b))
-                .map(|entry| (entry.key(), Value::from_entry(entry))),
-        ))
+        if let Some(snapshot) = opt.snapshot() {
+            let snapshot_ver = snapshot.version();
+            let iter = iter.filter(move |entry| entry.version() <= snapshot_ver);
+            ScanIter::new(
+                EqualFilter::new(iter, |a: &&KvEntry, b: &&KvEntry| !a.equal_key(b))
+                    .map(|entry| (entry.key(), Value::from_entry(entry))),
+            )
+            .with(inner)
+        } else {
+            ScanIter::new(
+                EqualFilter::new(iter, |a: &&KvEntry, b: &&KvEntry| !a.equal_key(b))
+                    .map(|entry| (entry.key(), Value::from_entry(entry))),
+            )
+        }
     }
 }
 
-impl KVWriter for Memtable {
-    fn set(&mut self, opt: &WriteOption, entry: KvEntry) -> SetResult<()> {
-        if self.list.len() == 0 {
-            self.min_ver = entry.version();
+fn map_bound<'a, T>(b: &'a Bound<T>) -> Bound<&'a T> {
+    use std::ops::Bound::*;
+    unsafe {
+        match b {
+            Unbounded => Unbounded,
+            Included(x) => Included((x as *const T).as_ref().unwrap()),
+            Excluded(x) => Excluded((x as *const T).as_ref().unwrap()),
         }
-        self.total_bytes += entry.bytes();
-        self.list.insert(entry);
+    }
+}
+
+impl Memtable {
+    pub fn set(&self, opt: &WriteOption, entry: KvEntry) -> SetResult<()> {
+        if self.inner.list.len() == 0 {
+            self.min_ver
+                .store(entry.version(), std::sync::atomic::Ordering::Release);
+        }
+        self.total_bytes
+            .fetch_add(entry.bytes(), std::sync::atomic::Ordering::AcqRel);
+        let l = (&self.inner.list as *const skiplist::OrderedSkipList<KvEntry>);
+        unsafe {
+            let l = (l as *mut skiplist::OrderedSkipList<KvEntry>)
+                .as_mut()
+                .unwrap();
+            l.insert(entry);
+        }
+
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod test {
-    use rand::seq::SliceRandom;
-
     use super::*;
-
-    fn load_test_data() -> (Vec<String>, Vec<String>) {
-        let mut input: Vec<String> = (0..100).into_iter().map(|k| k.to_string()).collect();
-        input.shuffle(&mut rand::thread_rng());
-        let mut sorted_input = input.clone();
-        sorted_input.sort();
-        (input, sorted_input)
-    }
-
-    fn init_table() -> (Vec<String>, Memtable, u64) {
-        let (input, sorted_input) = load_test_data();
-        let mut ver = 0;
-
-        let mut table = Memtable::new(0);
-        let opt = WriteOption::default();
-        for key in input {
-            let entry = KvEntry::new(key, "abc", None, ver);
-            table.set(&opt, entry).unwrap();
-            ver += 1;
-        }
-        (sorted_input, table, ver)
-    }
 
     #[test]
     pub fn get_memtable() {
-        let (_, mut table, mut ver) = init_table();
+        let (sorted_input, table, ver) = crate::test::init_table();
+
         let opt = GetOption::default();
-        let sopt = WriteOption::default();
 
-        let v3 = table.get(&opt, "13");
-        assert!(table.get(&opt, "1").is_some());
-        assert!(v3.is_some());
+        // basic get
+        assert_eq!(
+            table.get(&opt, "101".into()).unwrap().version(),
+            sorted_input[1].1
+        );
 
-        assert_eq!(table.scan(&opt, "2", "22").count(), 4); // 2, 20, 21, 22
+        // multi-version get
+        let v3 = table.get(&opt, "133".into());
+        assert_eq!(v3.unwrap().version(), ver - 3);
 
-        // insert snapshot
-        table.set(&sopt, KvEntry::new_del("13", ver)).unwrap();
-        ver += 1;
-
-        table
-            .set(&sopt, KvEntry::new("13", "value", None, ver))
-            .unwrap();
-        ver += 1;
         // get snapshot
+        let v3 = table.get(
+            &GetOption::with_snapshot(sorted_input[33].1 + 1),
+            "133".into(),
+        );
+        assert_eq!(v3.unwrap().version(), sorted_input[33].1);
+        let v3 = table.get(&GetOption::with_snapshot(sorted_input[33].1), "133".into());
+        assert_eq!(v3.unwrap().version(), sorted_input[33].1);
 
-        assert!(table
-            .get(&GetOption::with_snapshot(ver - 2), "13")
-            .unwrap()
-            .deleted()); // deleted key in ver-2
+        // get deleted
+        let v4 = table.get(&opt, "144".into());
+        assert!(v4.unwrap().deleted());
 
-        let v3_new = table.get(&GetOption::with_snapshot(v3.unwrap().version()), "13");
-        assert!(v3_new.is_some());
-        assert!(!v3_new.unwrap().deleted());
+        let v4 = table.get(&GetOption::with_snapshot(ver - 2), "144".into());
+        assert_eq!(v4.unwrap().version(), ver - 4);
 
-        assert!(table.get(&GetOption::with_snapshot(ver), "13").map(|v| v.version()).unwrap_or_default() == ver - 1);
+        let v4 = table.get(&GetOption::with_snapshot(ver - 5), "144".into());
+        assert_eq!(v4.unwrap().version(), sorted_input[44].1);
+
+        // set & delete & set
+
+        let v5 = table.get(&GetOption::with_snapshot(ver - 2), "155".into());
+        assert!(v5.unwrap().deleted());
+
+        // scan tables
+        assert_eq!(
+            table
+                .scan(&opt, Bytes::from("100")..=Bytes::from("110"))
+                .count(),
+            11
+        );
+
+        // full scan
+        assert_eq!(table.scan(&opt, ..).count(), 200);
+        // filter deleted
+        assert_eq!(
+            table.scan(&opt, ..).filter(|(_, v)| !v.deleted()).count(),
+            199
+        );
+
+        // scan all
+        for (idx, entry) in table.scan(&opt, ..).enumerate() {
+            assert_eq!(sorted_input[idx].0, entry.0);
+        }
     }
 
     #[test]
     pub fn write_memtable() {
-        let (sorted_input, table, _) = init_table();
+        let (_, mut table, ver) = crate::test::init_table();
         let opt = GetOption::default();
 
-        assert_eq!(sorted_input.len(), table.scan(&opt, "", "").count());
-        // scan all
-        for (idx, entry) in table.into_iter().enumerate() {
-            assert_eq!(sorted_input[idx], entry.key);
-        }
-    }
+        table
+            .set(&WriteOption::default(), KvEntry::new("0", "1", None, ver))
+            .unwrap();
 
-    #[test]
-    pub fn del() {
-        let (mut sorted_input, mut table, ver) = init_table();
-        let opt = WriteOption::default();
-
-        table.set(&opt, KvEntry::new_del("58", ver)).unwrap();
-
-        assert_eq!(
-            sorted_input.len(),
-            table.scan(&GetOption::default(), "", "").count()
-        );
-
-        // scan all
-        for (idx, (key, value)) in table.scan(&GetOption::default(), "", "").enumerate() {
-            if key == "58" {
-                assert!(value.deleted());
-            }
-            assert_eq!(sorted_input[idx], key);
-        }
-
-        sorted_input.remove(sorted_input.iter().position(|r| r == "58").unwrap());
-
-        // range get
-        let mut n = 0;
-        // 55, 56, 57, 59, 6, 60
-        for (idx, (key, _)) in table
-            .scan(&GetOption::default(), "55", "60")
-            .filter(|(_, v)| !v.deleted())
-            .enumerate()
-        {
-            assert_ne!("58", key);
-            assert_eq!(sorted_input[idx + 51], key);
-            n += 1;
-        }
-        assert_eq!(n, 6);
+        assert!(table.get(&opt, "0".into()).is_some());
     }
 }

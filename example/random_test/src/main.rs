@@ -1,7 +1,9 @@
+use std::collections::{HashMap, HashSet};
+
 use ::storage::*;
 use bytes::Bytes;
 use rand::distributions::Alphanumeric;
-use rand::Rng;
+use rand::{Rng, RngCore};
 fn rand_key() -> String {
     let mut rng = rand::thread_rng();
     let len = rng.gen_range(2..15);
@@ -17,13 +19,13 @@ fn rand_value() -> Bytes {
     let mut vec = Vec::new();
     vec.resize(len, 0);
 
-    // rng.fill_bytes(&mut vec[..]);
+    rng.fill_bytes(&mut vec[..]);
     vec.into()
 }
 
 fn is_deleted() -> bool {
     let mut rng = rand::thread_rng();
-    rng.gen_bool(0.09)
+    rng.gen_bool(0.1)
 }
 
 fn main() {
@@ -33,27 +35,38 @@ fn main() {
 
     let mut ins = Instance::new(config);
 
-    let mut deleted_keys = Vec::new();
+    let total_test: usize = 1_000_00;
 
-    let total_test: usize = 1_000_000;
+    let mut exist_key = HashSet::<String>::new();
 
     for i in 0..total_test {
-        let key = rand_key();
-        let value = rand_value();
-        if is_deleted() {
-            deleted_keys.push(key.to_owned());
-        }
+        if is_deleted() && exist_key.len() > 0 {
+            let del_key = exist_key.iter().next().unwrap().clone();
 
-        if is_deleted() && deleted_keys.len() > 0 {
-            let del_key = deleted_keys.first().unwrap();
             // make sure del_key exist
-            ins.mut_storage().get(&GetOption::default(), del_key.clone()).unwrap();
+            ins.mut_storage()
+                .get(&GetOption::default(), del_key.clone())
+                .unwrap();
 
-            ins.mut_storage().del(&WriteOption::default(), del_key).unwrap();
-            deleted_keys.remove(0);
+            ins.mut_storage()
+                .del(&WriteOption::default(), del_key.clone())
+                .unwrap();
+
+            exist_key.remove(&del_key);
+        } else {
+            let key = loop {
+                let key = rand_key();
+                if exist_key.insert(key.clone()) {
+                    break key;
+                }
+            };
+
+            let value = rand_value();
+
+            ins.mut_storage()
+                .set(&WriteOption::default(), key, value)
+                .unwrap();
         }
-
-        ins.mut_storage().set(&WriteOption::default(), key, value).unwrap();
 
         let p = i / (total_test / 100);
 
@@ -62,5 +75,11 @@ fn main() {
         }
     }
 
-    let iter = ins.mut_storage().scan(&GetOption::default(),"", "zzzzzzzzzz");
+    let iter = ins.mut_storage().scan(&GetOption::default(), ..);
+
+    println!(
+        "scan all keys in db {} should be {}",
+        iter.count(),
+        exist_key.len()
+    );
 }

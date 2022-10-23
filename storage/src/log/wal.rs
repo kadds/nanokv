@@ -15,7 +15,7 @@ const DEFAULT_ALLOC_SIZE: usize = 1024 * 1024 * 5;
 pub struct LogWriter<E, S> {
     current: LogFile,
     seq: u64,
-    path: String,
+    prefix: String,
     last_size: usize,
     write_bytes: u64,
 
@@ -28,11 +28,11 @@ impl<E, S> LogWriter<E, S>
 where
     S: LogEntrySerializer<Entry = E>,
 {
-    pub fn new(serializer: S, seq: u64, path: String) -> Self {
+    pub fn new(serializer: S, seq: u64, prefix: String) -> Self {
         Self {
-            current: LogFile::new(seq, DEFAULT_ALLOC_SIZE, &path),
+            current: LogFile::new(seq, DEFAULT_ALLOC_SIZE, &prefix),
             seq,
-            path,
+            prefix,
             last_size: DEFAULT_ALLOC_SIZE,
             write_bytes: 0,
             serializer,
@@ -99,12 +99,12 @@ where
         self.sync();
 
         self.seq = seq;
-        self.current = LogFile::new(self.seq, self.last_size, &self.path);
-        info!("wal rotate {}/{}", self.path, seq);
+        self.current = LogFile::new(self.seq, self.last_size, &self.prefix);
+        info!("wal rotate to {}{}", self.prefix, seq);
     }
 
-    pub fn remove(&mut self, seq: u64) {
-        LogFile::remove(seq, &self.path);
+    pub fn remove(&self, seq: u64) {
+        LogFile::remove(seq, &self.prefix);
     }
 
     pub fn bytes(&self) -> u64 {

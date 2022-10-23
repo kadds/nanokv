@@ -1,35 +1,70 @@
+use std::{
+    collections::HashSet,
+    ops::{Range, RangeBounds},
+    sync::Arc,
+};
+
 use bytes::Bytes;
 
-use super::{GetOption, KVReader, KvEntry, Memtable};
-use crate::{iterator::Iter, value::Value, KvIterator};
+use super::{GetOption, KvEntry, Memtable};
+use crate::{
+    iterator::{IteratorContext, ScanIter},
+    util::eq_filter::EqualFilter,
+    value::Value,
+    KvIterator,
+};
+use superslice::*;
 
 #[derive(Debug)]
 pub struct Imemtable {
-    keys: Vec<KvEntry>,
+    keys: Arc<Vec<KvEntry>>,
     seq: u64,
 
     min_ver: u64,
     max_ver: u64,
 }
 
-impl From<Memtable> for Imemtable {
-    fn from(memtable: Memtable) -> Self {
+impl IteratorContext for Vec<KvEntry> {
+    fn release(&mut self) {}
+}
+
+impl Imemtable {
+    pub fn new(memtable: Memtable, reserved_version: u64) -> Self {
         let seq = memtable.seq();
         let cap = memtable.len();
         let mut keys = Vec::with_capacity(cap);
         let mut min_ver = u64::MAX;
         let mut max_ver = u64::MIN;
-        for item in memtable.into_iter() {
-            if item.deleted() {
-                continue;
-            }
+
+        for item in memtable.iter() {
             min_ver = min_ver.min(item.version());
             max_ver = max_ver.max(item.version());
-            keys.push(item);
+            keys.push(item.to_owned());
         }
 
+        let mut map = HashSet::new();
+        let new_keys = keys
+            .into_iter()
+            .rev()
+            .filter(|item| {
+                if item.version() < reserved_version {
+                    match map.get(&item.key) {
+                        Some(_) => false,
+                        None => {
+                            map.insert(item.key.clone());
+                            true
+                        }
+                    }
+                } else {
+                    true
+                }
+            })
+            .collect();
+        keys = new_keys;
+        keys.reverse();
+
         Self {
-            keys,
+            keys: Arc::new(keys),
             seq,
             min_ver,
             max_ver,
@@ -68,104 +103,132 @@ impl Imemtable {
     }
 }
 
-impl<'a> KVReader<'a> for Imemtable {
-    fn get<K: Into<Bytes>>(&self, opt: &GetOption, key: K) -> Option<Value> {
-        let key = key.into();
+impl Imemtable {
+    pub fn get(&self, opt: &GetOption, key: Bytes) -> Option<Value> {
+        let mut range = self.keys.equal_range_by(|entry| entry.key().cmp(&key));
 
-        let mut idx = self
-            .keys
-            .binary_search_by(|entry| entry.key().cmp(&key))
-            .ok()?;
+        if range.len() == 0 {
+            return None;
+        }
 
         if let Some(snapshot) = &opt.snapshot() {
-            while idx < self.keys.len() {
+            for idx in range {
                 if self.keys[idx].version() <= snapshot.version() {
                     return Some(Value::from_entry(&self.keys[idx]));
                 }
-                idx += 1;
             }
         } else {
+            let idx = unsafe { range.next().unwrap_unchecked() };
             return Some(Value::from_entry(&self.keys[idx]));
         }
         None
     }
 
-    fn scan<K: Into<Bytes>>(
-        &'a self,
+    pub fn scan(
+        &self,
         opt: &GetOption,
-        beg: K,
-        end: K,
-    ) -> Box<dyn KvIterator<Item = (Bytes, Value)> + 'a> {
-        let beg = beg.into();
-        let end = end.into();
-        let beg_index = if beg.len() == 0 {
-            0
-        } else {
-            self.keys.partition_point(|entry| entry.key() < beg)
+        range: impl RangeBounds<Bytes>,
+    ) -> ScanIter<(Bytes, Value)> {
+        use std::ops::Bound::*;
+        let beg = match range.start_bound() {
+            Included(val) => self.keys.lower_bound_by(|entry| entry.key().cmp(&val)),
+            Excluded(val) => self.keys.upper_bound_by(|entry| entry.key().cmp(&val)),
+            Unbounded => 0,
         };
-        let end_index = if end.len() == 0 {
-            self.keys.len()
-        } else {
-            self.keys.partition_point(|entry| entry.key() < end)
+        let end = match range.end_bound() {
+            Included(val) => self.keys.upper_bound_by(|entry| entry.key().cmp(&val)),
+            Excluded(val) => self.keys.lower_bound_by(|entry| entry.key().cmp(&val)),
+            Unbounded => self.keys.len(),
         };
-
-        Box::new(Iter::from(
-            self.keys[beg_index..end_index]
-                .iter()
+        let keys = self.keys.clone();
+        let slice = unsafe { core::mem::transmute::<_, &'static [KvEntry]>(&keys[beg..end]) };
+        if let Some(snapshot) = opt.snapshot() {
+            let snapshot_ver = snapshot.version();
+            ScanIter::new(
+                EqualFilter::new(
+                    slice
+                        .iter()
+                        .filter(move |entry| entry.version() <= snapshot_ver),
+                    |a: &&KvEntry, b: &&KvEntry| !a.equal_key(b),
+                )
                 .map(|entry| (entry.key(), Value::from_entry(entry))),
-        ))
+            )
+            .with(keys)
+        } else {
+            ScanIter::new(
+                EqualFilter::new(slice.iter(), |a: &&KvEntry, b: &&KvEntry| !a.equal_key(b))
+                    .map(|entry| (entry.key(), Value::from_entry(entry))),
+            )
+            .with(keys)
+        }
     }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::kv::{KVWriter, WriteOption};
+    use crate::kv::WriteOption;
 
     use super::*;
-    use rand::seq::SliceRandom;
-
-    fn load_test_data() -> (Vec<String>, Vec<String>) {
-        let mut input: Vec<String> = (0..100).into_iter().map(|k| k.to_string()).collect();
-        input.shuffle(&mut rand::thread_rng());
-        let mut sorted_input = input.clone();
-        sorted_input.sort();
-        (input, sorted_input)
-    }
-
-    fn init_table() -> (Vec<String>, Imemtable, u64) {
-        let (input, mut sorted_input) = load_test_data();
-        let mut ver = 0;
-
-        let mut table = Memtable::new(0);
-        for key in input {
-            let entry = KvEntry::new(key, "abc", None, ver);
-            table.set(&WriteOption::default(), entry).unwrap();
-            ver += 1;
-        }
-        // remove 0
-        sorted_input.remove(0);
-
-        table
-            .set(&WriteOption::default(), KvEntry::new_del("0", ver))
-            .unwrap();
-
-        (sorted_input, table.into(), ver)
-    }
 
     #[test]
-    pub fn test_imemtable() {
-        let (sorted_input, itable, _) = init_table();
+    pub fn get_imemtable() {
+        let (sorted_input, table, ver) = crate::test::init_itable();
 
-        for (idx, (key, _)) in itable.scan(&GetOption::default(), "", "").enumerate() {
-            assert_eq!(sorted_input[idx], key);
-        }
-        assert_eq!(itable.scan(&GetOption::default(), "", "").count(), 99);
+        let opt = GetOption::default();
+
+        // basic get
         assert_eq!(
-            itable.min_max().unwrap(),
-            (
-                Bytes::from(sorted_input.first().unwrap().clone()),
-                Bytes::from(sorted_input.last().unwrap().clone())
-            )
+            table.get(&opt, "101".into()).unwrap().version(),
+            sorted_input[1].1
         );
+
+        // multi-version get
+        let v3 = table.get(&opt, "133".into());
+        assert_eq!(v3.unwrap().version(), ver - 3);
+
+        // get snapshot
+        let v3 = table.get(
+            &GetOption::with_snapshot(sorted_input[33].1 + 1),
+            "133".into(),
+        );
+        assert_eq!(v3.unwrap().version(), sorted_input[33].1);
+        let v3 = table.get(&GetOption::with_snapshot(sorted_input[33].1), "133".into());
+        assert_eq!(v3.unwrap().version(), sorted_input[33].1);
+
+        // get deleted
+        let v4 = table.get(&opt, "144".into());
+        assert!(v4.unwrap().deleted());
+
+        let v4 = table.get(&GetOption::with_snapshot(ver - 2), "144".into());
+        assert_eq!(v4.unwrap().version(), ver - 4);
+
+        let v4 = table.get(&GetOption::with_snapshot(ver - 5), "144".into());
+        assert_eq!(v4.unwrap().version(), sorted_input[44].1);
+
+        // set & delete & set
+
+        let v5 = table.get(&GetOption::with_snapshot(ver - 2), "155".into());
+        assert!(v5.unwrap().deleted());
+
+        // scan tables
+        assert_eq!(
+            table
+                .scan(&opt, Bytes::from("100")..=Bytes::from("110"))
+                .count(),
+            11
+        );
+
+        // full scan
+        assert_eq!(table.scan(&opt, ..).count(), 200);
+        // filter deleted
+        assert_eq!(
+            table.scan(&opt, ..).filter(|(_, v)| !v.deleted()).count(),
+            199
+        );
+
+        // scan all
+        for (idx, entry) in table.scan(&opt, ..).enumerate() {
+            assert_eq!(sorted_input[idx].0, entry.0);
+        }
     }
 }

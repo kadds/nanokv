@@ -1,12 +1,24 @@
-use std::fs;
+use std::{
+    fs,
+    ops::{Bound, Range, RangeBounds},
+    sync::Arc,
+};
 
-use crate::snapshot::Snapshot;
+use crate::{
+    cache::Cache,
+    iterator::{MergedIter, ScanIter},
+    snapshot::Snapshot,
+    ConfigRef,
+};
+
+use self::raw_sst::RawSSTReader;
 
 use super::{
     manifest::{FileMetaData, Version, VersionRef},
-    KVReader, KvEntry,
+    KvEntry,
 };
 
+pub mod format;
 pub mod raw_sst;
 
 pub trait SSTWriter {
@@ -21,87 +33,82 @@ pub fn sst_name(base: &str, level: u32, seq: u64) -> String {
     format!("{}/sst/{}/{}.sst", base, level, seq)
 }
 
-struct MergedSSTReader {}
-
-impl MergedSSTReader {
-    pub fn new() -> Self {
-        Self {}
-    }
+pub trait SSTReader {
+    fn get(&self, opt: &crate::GetOption, key: bytes::Bytes) -> Option<crate::Value>;
+    fn scan(
+        &self,
+        opt: &crate::GetOption,
+        beg: Bound<bytes::Bytes>,
+        end: Bound<bytes::Bytes>,
+    ) -> ScanIter<(bytes::Bytes, crate::Value)>;
 }
 
-impl<'a> KVReader<'a> for MergedSSTReader {
-    fn get<K: Into<bytes::Bytes>>(&self, opt: &super::GetOption, key: K) -> Option<crate::Value> {
-        todo!()
-    }
-
-    fn scan<K: Into<bytes::Bytes>>(
-        &'a self,
-        opt: &super::GetOption,
-        beg: K,
-        end: K,
-    ) -> Box<dyn crate::KvIterator<Item = (bytes::Bytes, crate::Value)> + 'a> {
-        todo!()
-    }
-}
-
-// pub struct LeveledSSTReader {
-//     level: u32,
-//     inner: MergedSSTReader,
-// }
-
-// impl LeveledSSTReader {
-//     pub fn new(level: u32) -> Self {
-//         Self {
-//             level,
-//             inner: MultiSSTReader::new(),
-//         }
-//     }
-// }
-
-// impl<'a> KVReader<'a> for LeveledSSTReader {
-//     fn get_ver(&self, key: &str, ver: u64) -> Option<crate::value::Value> {
-//         todo!()
-//     }
-
-//     fn get(&self, key: &str) -> Option<crate::value::Value> {
-//         todo!()
-//     }
-
-//     fn scan(
-//         &'a self,
-//         beg: &str,
-//         end: &str,
-//     ) -> Box<dyn Iterator<Item = (&'a str, crate::value::Value)> + 'a> {
-//         todo!()
-//     }
-
-//     fn iter(&'a self) -> Box<dyn Iterator<Item = (&'a str, crate::value::Value)> + 'a> {
-//         todo!()
-//     }
-// }
-
-pub struct SnapshotTable {
+pub struct SnapshotTable<'a> {
     snapshot: Snapshot,
-    // L0 reader
+    version: VersionRef,
+    config: ConfigRef,
+    cache: &'a Cache,
 }
 
-impl From<Snapshot> for SnapshotTable {
-    fn from(v: Snapshot) -> Self {
-        Self { snapshot: v }
+impl<'a> SnapshotTable<'a> {
+    pub fn new(
+        snapshot: Snapshot,
+        version: VersionRef,
+        config: ConfigRef,
+        cache: &'a Cache,
+    ) -> Box<Self> {
+        Self {
+            snapshot,
+            version,
+            config,
+            cache,
+        }
+        .into()
     }
 }
 
-impl<'a> KVReader<'a> for SnapshotTable {
-    fn get<K: Into<bytes::Bytes>>(&self, opt: &super::GetOption, key: K) -> Option<crate::Value> {
-        todo!()
+impl<'a> SnapshotTable<'a> {
+    pub fn get(&self, opt: &crate::GetOption, key: bytes::Bytes) -> Option<crate::Value> {
+        // search from L0
+
+        let iter = self
+            .version
+            .level_n(0)
+            .filter(|file| file.min_ver <= self.snapshot.version())
+            .map(|file| RawSSTReader::new(&sst_name(&self.config.path, file.level, file.seq)));
+
+        for file_reader in iter {
+            let value = file_reader.get(opt, key.clone());
+            if let Some(value) = value {
+                return Some(value);
+            }
+        }
+
+        None
     }
 
-    fn scan<K: Into<bytes::Bytes>>(
-        &'a self,
-        opt: &super::GetOption,
-        beg: K,
-        end: K,
-    ) -> Box<dyn crate::KvIterator<Item = (bytes::Bytes, crate::Value)> + 'a> {
-        todo!()
+    pub fn scan(
+        &self,
+        opt: &crate::GetOption,
+        range: impl RangeBounds<bytes::Bytes>,
+    ) -> ScanIter<(bytes::Bytes, crate::Value)> {
+        // scan from L0
+
+        let iter = self
+            .version
+            .level_n(0)
+            .filter(|file| file.min_ver <= self.snapshot.version())
+            .map(|file| self.cache.get_opened_sst(file.level, file.seq));
+
+        let mut iters = Vec::new();
+        for file_reader in iter {
+            iters.push(file_reader.scan(
+                opt,
+                range.start_bound().cloned(),
+                range.end_bound().cloned(),
+            ));
+        }
+
+        ScanIter::new(MergedIter::new(iters))
     }
 }

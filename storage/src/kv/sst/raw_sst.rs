@@ -1,13 +1,15 @@
 use byteorder::ByteOrder;
 use bytes::Bytes;
 
-use crate::kv::{KVReader, KvEntry};
+use crate::kv::KvEntry;
 use crate::value::Value;
 use byteorder::LE;
 use std::fs::File;
 use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::ops::{Range, RangeBounds};
+use std::sync::Arc;
 
-use super::{FileMetaData, SSTWriter};
+use super::{FileMetaData, SSTReader, SSTWriter};
 
 struct RawSSTIterator {}
 
@@ -47,7 +49,7 @@ impl RawSSTReader {
 }
 
 impl RawSSTReader {
-    fn lower_bound(&self, key: &str) -> u64 {
+    fn lower_bound(&self, key: &Bytes) -> u64 {
         let mut left = 0 as u64;
         let mut right = self.meta.total_keys;
 
@@ -62,7 +64,7 @@ impl RawSSTReader {
         }
         left
     }
-    fn upper_bound(&self, key: &str) -> u64 {
+    fn upper_bound(&self, key: &Bytes) -> u64 {
         let mut left = 0 as u64;
         let mut right = self.meta.total_keys;
 
@@ -83,10 +85,13 @@ impl RawSSTReader {
         RawSSTEntry::read(&slice[offset as usize..])
     }
 
-    fn index(&self, index: u64) -> RawSSTEntry {
+    fn index(&self, index: u64) -> Option<RawSSTEntry> {
         let slice = self.mmap.get(0..self.size as usize).unwrap();
+        if index >= self.meta.total_keys {
+            return None;
+        }
         let offset = LE::read_u64(&slice[(self.meta.index_offset + index * 8) as usize..]);
-        RawSSTEntry::read(&slice[offset as usize..])
+        Some(RawSSTEntry::read(&slice[offset as usize..]))
     }
     fn index_key(&self, index: u64) -> &str {
         let slice = self.mmap.get(0..self.size as usize).unwrap();
@@ -95,17 +100,34 @@ impl RawSSTReader {
     }
 }
 
-impl<'a> KVReader<'a> for RawSSTReader {
-    fn get<K: Into<Bytes>>(&self, opt: &crate::kv::GetOption, key: K) -> Option<Value> {
-        todo!()
+impl SSTReader for RawSSTReader {
+    fn get(&self, opt: &crate::GetOption, key: Bytes) -> Option<Value> {
+        let ver = opt.snapshot().map(|v| v.version()).unwrap_or(u64::MAX);
+        let mut index = self.lower_bound(&key);
+        loop {
+            let entry = match self.index(index) {
+                Some(e) => e,
+                None => break,
+            };
+            if entry.key_bytes == key {
+                if entry.version <= ver {
+                    return Some(Value::new(entry.value_bytes, entry.version));
+                }
+            } else {
+                break;
+            }
+
+            index += 1;
+        }
+        None
     }
 
-    fn scan<K: Into<Bytes>>(
-        &'a self,
-        opt: &crate::kv::GetOption,
-        beg: K,
-        end: K,
-    ) -> Box<dyn crate::KvIterator<Item = (Bytes, Value)> + 'a> {
+    fn scan(
+        &self,
+        opt: &crate::GetOption,
+        beg: std::ops::Bound<bytes::Bytes>,
+        end: std::ops::Bound<bytes::Bytes>,
+    ) -> crate::iterator::ScanIter<(bytes::Bytes, crate::Value)> {
         todo!()
     }
 }

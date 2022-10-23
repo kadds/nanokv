@@ -1,20 +1,9 @@
 use std::io::{self, Read};
 
-use crate::{log::LogEntrySerializer, snapshot::Snapshot, value::Value, KvIterator, GetOption, WriteOption};
+use crate::{iterator::ScanIter, log::LogEntrySerializer, value::Value, GetOption, WriteOption};
 use bitflags::bitflags;
 use byteorder::{ByteOrder, ReadBytesExt, WriteBytesExt, LE};
-use bytes::{BufMut, Bytes};
-
-pub trait KVReader<'a> {
-    fn get<K: Into<Bytes>>(&self, opt: &GetOption, key: K) -> Option<Value>;
-
-    fn scan<K: Into<Bytes>>(
-        &'a self,
-        opt: &GetOption,
-        beg: K,
-        end: K,
-    ) -> Box<dyn KvIterator<Item = (Bytes, Value)> + 'a>;
-}
+use bytes::Bytes;
 
 #[derive(Debug)]
 pub enum SetError {
@@ -25,10 +14,6 @@ pub enum SetError {
 }
 
 pub type SetResult<T> = std::result::Result<T, SetError>;
-
-pub trait KVWriter {
-    fn set(&mut self, opt: &WriteOption, entry: KvEntry) -> SetResult<()>;
-}
 
 // pub trait LogSerializer<W> {
 //     fn serialize_log(&self, writer: &mut W);
@@ -220,10 +205,11 @@ impl Eq for KvEntry {}
 
 impl Ord for KvEntry {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        if self.key == other.key {
-            return self.version().cmp(&other.version());
+        match self.key.cmp(&other.key) {
+            std::cmp::Ordering::Equal => {}
+            o => return o,
         }
-        other.key.cmp(&self.key)
+        other.ver.cmp(&self.ver)
     }
 }
 
@@ -247,5 +233,5 @@ pub mod imemtable;
 pub mod manifest;
 pub mod memtable;
 pub mod sst;
-pub type Memtable = memtable::Memtable;
-pub type Imemtable = imemtable::Imemtable;
+pub use imemtable::Imemtable;
+pub use memtable::Memtable;

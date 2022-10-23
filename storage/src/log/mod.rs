@@ -34,9 +34,8 @@ bitflags! {
 }
 
 impl LogFile {
-    pub fn new(seq: u64, alloc_size: usize, path: &str) -> Self {
-        let _ = fs::create_dir_all(path);
-        let name = format!("{}/{}.log", path, seq);
+    pub fn new(seq: u64, alloc_size: usize, prefix: &str) -> Self {
+        let name = format!("{}{}.log", prefix, seq);
         let file = File::create(&name).unwrap();
         file.set_len(alloc_size as u64).unwrap();
         Self { file, name }
