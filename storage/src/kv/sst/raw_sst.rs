@@ -1,5 +1,6 @@
-use byteorder::ByteOrder;
-use bytes::Bytes;
+use byteorder::{ByteOrder, WriteBytesExt};
+use bytes::{Buf, Bytes};
+use integer_encoding::{VarIntReader, VarIntWriter};
 use log::info;
 
 use crate::iterator::{EqualFilter, IteratorContext, ScanIter};
@@ -8,10 +9,13 @@ use crate::value::Value;
 use crate::KvIterator;
 use byteorder::LE;
 use std::fs::File;
-use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Seek, SeekFrom, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::{FileMetaData, SSTReader, SSTWriter};
+
+const RAWSST_MAGIC: u32 = 0xA18C0001;
 
 struct RawSSTIter<'a> {
     reader: &'a RawSSTReaderInner,
@@ -49,6 +53,7 @@ impl<'a> KvIterator for RawSSTIter<'a> {
     fn prefetch(&mut self, _n: usize) {}
 }
 
+#[allow(unused)]
 struct RawSSTReaderInner {
     mmap: memmap2::Mmap,
     file: File,
@@ -66,61 +71,88 @@ pub struct RawSSTReader {
 }
 
 impl RawSSTReader {
-    pub fn new(name: &str, seq: u64) -> Self {
-        let mut file = File::open(name).unwrap();
-        let size = file.seek(SeekFrom::End(0)).unwrap();
-        file.seek(SeekFrom::Start(0)).unwrap();
+    pub fn new(name: PathBuf) -> io::Result<Self> {
+        let mut file = File::open(name)?;
+        let size = file.seek(SeekFrom::End(0))?;
+        file.seek(SeekFrom::Start(0))?;
 
-        let mmap = unsafe { memmap2::Mmap::map(&file).unwrap() };
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
         let slice = mmap.get(0..size as usize).unwrap();
 
-        let meta = RawSSTMetaInfo::read(slice);
+        let meta = RawSSTMetaInfo::read(slice)?;
+        if meta.magic != RAWSST_MAGIC {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "magic invalid"));
+        }
+        log::info!("{:?}", meta);
 
-        Self {
+        Ok(Self {
             inner: RawSSTReaderInner {
+                seq: meta.seq,
                 mmap,
                 file,
                 meta,
                 size,
-                seq,
             }
             .into(),
-        }
+        })
+    }
+
+    pub fn meta(&self) -> RawSSTMetaInfo {
+        self.inner.meta.clone()
+    }
+
+    pub fn get_index(&self, index: u64) -> Option<(Bytes, Value)> {
+        let entry = self.inner.index(index)?;
+        Some(kv_entry_to_value(entry.into()))
     }
 }
 
 impl RawSSTReaderInner {
     fn lower_bound(&self, key: &Bytes) -> u64 {
-        let mut left = 0_u64;
-        let mut right = self.meta.total_keys;
+        let key = unsafe {
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(key.as_ptr(), key.len()))
+        };
+        use std::cmp::Ordering::*;
 
-        while left < right {
-            let mid = left + (right - left) / 2;
-            let mid_key = self.index_key(mid);
-            if mid_key < key {
-                left = mid + 1;
-            } else {
-                right = mid;
-            }
+        let mut size = self.meta.total_keys;
+        if size == 0 {
+            return 0;
         }
-        left
+        let mut base = 0u64;
+        while size > 1 {
+            let half = size / 2;
+            let mid = base + half;
+            let cmp = unsafe { self.index_key_unchecked(mid).cmp(key) };
+            base = if cmp == Less { mid } else { base };
+            size -= half;
+        }
+        let cmp = unsafe { self.index_key_unchecked(base).cmp(key) };
+        base + (cmp == Less) as u64
     }
+
     fn upper_bound(&self, key: &Bytes) -> u64 {
-        let mut left = 0_u64;
-        let mut right = self.meta.total_keys;
+        let key = unsafe {
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(key.as_ptr(), key.len()))
+        };
+        use std::cmp::Ordering::*;
 
-        while left < right {
-            let mid = left + (right - left) / 2;
-            let mid_key = self.index_key(mid);
-            if mid_key < key {
-                left = mid + 1;
-            } else {
-                right = mid;
-            }
+        let mut size = self.meta.total_keys;
+        if size == 0 {
+            return 0;
         }
-        right
+        let mut base = 0u64;
+        while size > 1 {
+            let half = size / 2;
+            let mid = base + half;
+            let cmp = unsafe { self.index_key_unchecked(mid).cmp(key) };
+            base = if cmp == Greater { base } else { mid };
+            size -= half;
+        }
+        let cmp = unsafe { self.index_key_unchecked(base).cmp(key) };
+        base + (cmp != Greater) as u64
     }
 
+    #[allow(unused)]
     fn offset(&self, offset: u64) -> RawSSTEntry {
         let slice = self.mmap.get(0..self.size as usize).unwrap();
         RawSSTEntry::read(&slice[offset as usize..])
@@ -134,8 +166,15 @@ impl RawSSTReaderInner {
         let offset = LE::read_u64(&slice[(self.meta.index_offset + index * 8) as usize..]);
         Some(RawSSTEntry::read(&slice[offset as usize..]))
     }
+
+    #[allow(unused)]
     fn index_key(&self, index: u64) -> &str {
         let slice = self.mmap.get(0..self.size as usize).unwrap();
+        let offset = LE::read_u64(&slice[(self.meta.index_offset + index * 8) as usize..]);
+        RawSSTEntry::read_key(&slice[offset as usize..])
+    }
+    unsafe fn index_key_unchecked(&self, index: u64) -> &str {
+        let slice = self.mmap.get(0..self.size as usize).unwrap_unchecked();
         let offset = LE::read_u64(&slice[(self.meta.index_offset + index * 8) as usize..]);
         RawSSTEntry::read_key(&slice[offset as usize..])
     }
@@ -204,6 +243,7 @@ impl SSTReader for RawSSTReader {
 // raw sst entry
 //
 
+#[allow(unused)]
 struct RawSSTEntry {
     flags: u64,
     version: u64,
@@ -214,10 +254,6 @@ struct RawSSTEntry {
 }
 
 impl RawSSTEntry {
-    pub fn total_size(&self) -> u64 {
-        self.key_len as u64 + self.value_len as u64 + 8 + 8
-    }
-
     fn write<W: Write>(entry: &KvEntry, mut w: W) -> usize {
         let mut total = 0;
         let buf = entry.flags().to_le_bytes();
@@ -295,62 +331,69 @@ impl Into<KvEntry> for RawSSTEntry {
     }
 }
 
-#[derive(Debug, Default)]
-struct RawSSTMetaInfo {
-    total_keys: u64,
-    index_offset: u64,
-    level: u32,
-    version: u32,
-    meta_offset: u64,
-    magic: u32,
+#[derive(Debug, Default, Clone)]
+pub struct RawSSTMetaInfo {
+    pub seq: u64,
+    pub level: u32,
+    pub total_keys: u64,
+    pub index_offset: u64,
+
+    pub version: u32,
+    pub meta_size: u32,
+    pub magic: u32,
 }
 
 impl RawSSTMetaInfo {
-    pub fn write<W: Write>(&self, mut w: W) {
-        let buf = self.total_keys.to_le_bytes();
-        w.write_all(&buf).unwrap();
+    pub fn write<W: Write>(&mut self, mut w: W) -> io::Result<()> {
+        let mut bytes = 0;
+        bytes += w.write_varint(self.seq)?;
+        bytes += w.write_varint(self.level)?;
+        bytes += w.write_varint(self.total_keys)?;
+        bytes += w.write_varint(self.index_offset)?;
 
-        let buf = self.index_offset.to_le_bytes();
-        w.write_all(&buf).unwrap();
+        let meta_size = bytes as u32 + 12;
+        self.meta_size = meta_size;
 
-        let buf = self.level.to_le_bytes();
-        w.write_all(&buf).unwrap();
+        w.write_u32::<LE>(self.version)?;
+        w.write_u32::<LE>(meta_size)?;
+        w.write_u32::<LE>(self.magic)?;
 
-        let buf = self.version.to_le_bytes();
-        w.write_all(&buf).unwrap();
-
-        let buf = self.meta_offset.to_le_bytes();
-        w.write_all(&buf).unwrap();
-
-        let buf = self.magic.to_le_bytes();
-        w.write_all(&buf).unwrap();
+        Ok(())
     }
 
-    pub fn read(slice: &[u8]) -> Self {
+    pub fn read(slice: &[u8]) -> io::Result<Self> {
         // read tail first
         let len = slice.len();
-        assert!(len >= 12);
+        if len < 12 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid header"));
+        }
+
         let magic = LE::read_u32(&slice[(len - 4)..]);
-        let meta_offset = LE::read_u64(&slice[(len - 12)..(len - 4)]);
+        let meta_size = LE::read_u32(&slice[(len - 8)..(len - 4)]);
+        let version = LE::read_u32(&slice[(len - 12)..(len - 8)]);
 
-        assert!(len as u64 >= meta_offset);
-        let mut offset = meta_offset as usize;
-        let total_keys = LE::read_u64(&slice[offset..]);
-        offset += 8;
-        let index_offset = LE::read_u64(&slice[offset..]);
-        offset += 8;
-        let level = LE::read_u32(&slice[offset..]);
-        offset += 4;
-        let version = LE::read_u32(&slice[offset..]);
+        if len < meta_size as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid header meta size",
+            ));
+        }
 
-        Self {
+        let mut reader = slice[(len - meta_size as usize)..].reader();
+        let seq: u64 = reader.read_varint()?;
+        let level: u32 = reader.read_varint()?;
+        let total_keys: u64 = reader.read_varint()?;
+        let index_offset: u64 = reader.read_varint()?;
+
+        Ok(Self {
+            seq,
             total_keys,
             index_offset,
             level,
             version,
-            meta_offset,
+            meta_size,
             magic,
-        }
+        })
     }
 }
 
@@ -359,7 +402,7 @@ pub struct RawSSTWriter {
 }
 
 impl RawSSTWriter {
-    pub fn new(name: &str) -> Self {
+    pub fn new(name: PathBuf) -> Self {
         let file = File::create(name).unwrap();
         Self { file }
     }
@@ -412,20 +455,20 @@ impl SSTWriter for RawSSTWriter {
             w.write_all(&buf).unwrap();
         }
 
-        // meta info
-        let meta_offset_begin = w.seek(SeekFrom::Current(0)).unwrap();
-
-        let meta_info = RawSSTMetaInfo {
+        let mut meta_info = RawSSTMetaInfo {
+            seq,
             total_keys: keys,
             index_offset: key_offset_begin,
             level,
             version: 0,
-            meta_offset: meta_offset_begin,
-            magic: 0xA0230F00,
+            meta_size: 0,
+            magic: RAWSST_MAGIC,
         };
 
-        meta_info.write(&mut w);
+        meta_info.write(&mut w).unwrap();
         w.flush().unwrap();
+
+        info!("write raw sst meta info {:?}", meta_info);
 
         FileMetaData::new(seq, min_key, max_key, min_ver, max_ver, keys, level)
     }

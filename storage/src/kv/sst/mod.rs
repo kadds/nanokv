@@ -1,6 +1,7 @@
 use std::{
     fs,
     ops::{Bound, RangeBounds},
+    path::PathBuf,
 };
 
 use crate::{
@@ -9,8 +10,6 @@ use crate::{
     snapshot::Snapshot,
     ConfigRef,
 };
-
-use self::raw_sst::RawSSTReader;
 
 use super::{
     manifest::{FileMetaData, VersionRef, MAX_LEVEL},
@@ -29,12 +28,12 @@ pub trait SSTWriter {
 pub(crate) fn prepare_sst_dir(base: &str) {
     for level in 0..MAX_LEVEL {
         let parent = format!("{}/sst/{}", base, level);
-        let _ = fs::create_dir_all(parent).unwrap();
+        fs::create_dir_all(parent).unwrap();
     }
 }
 
-pub fn sst_name(base: &str, level: u32, seq: u64) -> String {
-    format!("{}/sst/{}/{}.sst", base, level, seq)
+pub fn sst_name(base: &str, level: u32, seq: u64) -> PathBuf {
+    format!("{}/sst/{}/{}.sst", base, level, seq).into()
 }
 
 pub trait SSTReader {
@@ -50,6 +49,7 @@ pub trait SSTReader {
 pub struct SnapshotTable<'a> {
     snapshot: Snapshot,
     version: VersionRef,
+    #[allow(unused)]
     config: ConfigRef,
     cache: &'a Cache,
 }

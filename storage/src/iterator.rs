@@ -1,7 +1,6 @@
 use std::{collections::BinaryHeap, sync::Arc};
 
 use bytes::Bytes;
-use log::info;
 
 pub trait KvIterator: Iterator {
     fn prefetch(&mut self, n: usize);
@@ -87,9 +86,8 @@ where
     fn next(&mut self) -> Option<Self::Item> {
         if !self.init {
             for (idx, iter) in self.iters.iter_mut().enumerate() {
-                match iter.next() {
-                    Some(val) => self.heap.push(MergedItem { t: val, idx }),
-                    None => (),
+                if let Some(val) = iter.next() {
+                    self.heap.push(MergedItem { t: val, idx });
                 }
             }
 

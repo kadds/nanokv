@@ -94,6 +94,10 @@ impl Imemtable {
     pub fn len(&self) -> usize {
         self.keys.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
 }
 
 impl Imemtable {

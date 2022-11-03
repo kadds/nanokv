@@ -3,7 +3,7 @@ pub mod compaction;
 pub mod config;
 pub mod instance;
 pub mod iterator;
-mod kv;
+pub mod kv;
 mod log;
 pub mod option;
 pub mod snapshot;
@@ -35,6 +35,7 @@ mod test {
         input
     }
 
+    #[allow(unused)]
     pub fn init_table() -> (Vec<(String, u64)>, Memtable, u64) {
         let input = load_test_data();
         let mut ver = 0;
@@ -67,6 +68,7 @@ mod test {
         (sorted_input, table, ver)
     }
 
+    #[allow(unused)]
     pub fn init_itable() -> (Vec<(String, u64)>, Imemtable, u64) {
         let (sorted_input, table, ver) = crate::test::init_table();
         (sorted_input, Imemtable::new(table, 0), ver)

@@ -2,6 +2,7 @@ use std::{fs, sync::Arc};
 
 use crate::{config::ConfigRef, kv::manifest::Manifest, storage::Storage};
 
+#[allow(unused)]
 pub struct Instance {
     manifest: Arc<Manifest>,
     storage: Storage,

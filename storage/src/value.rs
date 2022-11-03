@@ -5,6 +5,7 @@ use crate::{iterator::KvIteratorItem, kv::KvEntry};
 #[derive(Debug)]
 enum LazyValueRef {
     Inplace(Bytes),
+    #[allow(unused)]
     Extern(u64),
     Del,
 }

@@ -12,7 +12,7 @@ pub use wal::LogWriter;
 
 pub struct LogFile {
     file: File,
-    name: String,
+    _name: String,
 }
 
 const SEGMENT_SIZE: usize = 1024 * 32; // 32k
@@ -38,13 +38,13 @@ impl LogFile {
         let name = format!("{}{}.log", prefix, seq);
         let file = File::create(&name).unwrap();
         file.set_len(alloc_size as u64).unwrap();
-        Self { file, name }
+        Self { file, _name: name }
     }
 
     pub fn open(seq: u64, path: &str) -> Option<Self> {
         let name = format!("{}/{}.log", path, seq);
         let file = File::open(&name).ok()?;
-        Some(Self { file, name })
+        Some(Self { file, _name: name })
     }
 
     pub fn file(&mut self) -> &mut File {
@@ -56,6 +56,7 @@ impl LogFile {
         let _ = fs::remove_file(&name);
     }
 
+    #[allow(unused)]
     fn make_sure(&mut self, alloc_size: usize) {
         self.file.set_len(alloc_size as u64).unwrap();
     }

@@ -107,6 +107,7 @@ where
         LogFile::remove(seq, &self.prefix);
     }
 
+    #[allow(unused)]
     pub fn bytes(&self) -> u64 {
         self.write_bytes
     }

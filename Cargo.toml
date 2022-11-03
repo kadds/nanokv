@@ -1,2 +1,2 @@
 [workspace]
-members = ["./storage", "./example/random_test"]
+members = ["./storage", "./example/random_test", "./kvutil"]

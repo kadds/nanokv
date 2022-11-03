@@ -31,6 +31,7 @@ use crate::{
 #[derive(Debug)]
 struct Imemtables {
     imemtables: VecDeque<Arc<Imemtable>>,
+    #[allow(unused)]
     config: ConfigRef,
 }
 

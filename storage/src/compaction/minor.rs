@@ -26,6 +26,8 @@ pub struct MinorSerializer {
     rx: mpsc::Receiver<Option<Arc<Imemtable>>>,
     tx: mpsc::Sender<Option<Arc<Imemtable>>>,
     commit_tx: mpsc::SyncSender<(Arc<Imemtable>, Arc<FileMetaData>)>,
+
+    #[allow(unused)]
     manifest: Arc<Manifest>,
 }
 
@@ -62,8 +64,7 @@ impl MinorSerializer {
             let meta = {
                 let seq = table.seq();
                 let iter = table.entry_iter().filter(|entry| !entry.deleted());
-                let mut sst =
-                    sst::raw_sst::RawSSTWriter::new(&sst_name(&conf.path, 0, table.seq()));
+                let mut sst = sst::raw_sst::RawSSTWriter::new(sst_name(&conf.path, 0, table.seq()));
 
                 let meta = sst.write(0, seq, iter);
 

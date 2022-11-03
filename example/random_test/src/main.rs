@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use ::storage::*;
 use bytes::Bytes;
+use log::info;
 use rand::distributions::Alphanumeric;
 use rand::{Rng, RngCore};
 fn rand_key() -> String {
@@ -88,28 +89,23 @@ fn main() {
         let p = i / (total_test / 100);
 
         if i % (total_test / 100) == 0 {
-            println!("finish {}%", p)
+            info!("finish {}%", p)
         }
     }
 
     for key in &exist_keys {
-        if ins
+        assert!(ins
             .mut_storage()
             .get(&GetOption::default(), key.clone())
-            .is_none()
-        {
-            ins.mut_storage()
-                .get(&GetOption::default(), key.clone())
-                .unwrap();
-        }
+            .is_some())
     }
 
     let iter = ins.mut_storage().scan(&GetOption::default(), ..);
 
-    println!(
-        "scan all keys in db {} should be {}",
+    assert_eq!(
         iter.count(),
-        exist_keys.len()
+        exist_keys.len(),
+        "db key count != expected key count"
     );
 
     let iter = ins.mut_storage().scan(&GetOption::default(), ..);
@@ -118,16 +114,6 @@ fn main() {
 
     for (idx, val) in iter.enumerate() {
         let val = unsafe { String::from_utf8_unchecked(val.0.into()) };
-        if val != v[idx] {
-            if del_keys.get(&val).is_some() {
-                println!("somehow {} key exists", val);
-            }
-            println!(
-                "corruption at index {} read key {} expect key {}",
-                idx, val, v[idx]
-            );
-            ins.storage().get(&GetOption::default(), val).unwrap();
-            break;
-        }
+        assert_eq!(val, v[idx], "corruption at index {}", idx);
     }
 }

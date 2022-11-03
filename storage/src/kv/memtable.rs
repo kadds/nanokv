@@ -57,6 +57,9 @@ impl Memtable {
     pub fn len(&self) -> usize {
         self.inner.list.len()
     }
+    pub fn is_empty(&self) -> bool {
+        self.inner.list.is_empty()
+    }
 }
 
 impl Memtable {
