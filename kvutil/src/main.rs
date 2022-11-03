@@ -64,19 +64,14 @@ fn sst_get(path: PathBuf, key: Bytes, noval: bool) {
 fn print_item(key: Bytes, mut value: storage::Value, noval: bool) {
     if noval {
         if value.deleted() {
-            println!("{}, {:?}", value.version(), key)
+            println!("del,{},{:?}", value.version(), key)
         } else {
-            println!("{}, {:?}, exist", value.version(), key);
+            println!("exist,{},{:?}", value.version(), key);
         }
     } else if value.deleted() {
-        println!("{}, {:?} => {:?}", value.version(), key, value.value())
+        println!("del,{},{:?},{:?}", value.version(), key, value.value())
     } else {
-        println!(
-            "{}, {:?} => {:?}, exist",
-            value.version(),
-            key,
-            value.value()
-        );
+        println!("exist,{},{:?},{:?}", value.version(), key, value.value());
     }
 }
 

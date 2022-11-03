@@ -271,42 +271,17 @@ impl Storage {
 
         Ok(cur_ver)
     }
-}
 
-impl Storage {
-    fn rotate(&mut self) {
-        if self.memtable.len() == 0 {
-            return;
-        }
-        let new_seq = self.manifest.allocate_sst_sequence();
-        let mut memtable = Memtable::new(new_seq);
-        swap(&mut memtable, &mut self.memtable);
-
-        if let Some(wal) = &mut self.wal {
-            wal.rotate(new_seq);
-        }
-
-        let table = self.imemtables.push(Imemtable::new(
-            memtable,
-            self.manifest.oldest_snapshot_version(),
-        ));
-        self.serializer.compact_async(table);
-
-        while let Ok((table, meta)) = self.commit_rx.try_recv() {
-            if let Some(wal) = &mut self.wal {
-                wal.remove(table.seq());
-            }
-
-            self.imemtables.commit(table);
-            self.manifest.add_sst(meta);
-        }
-    }
-
-    fn shutdown(&mut self) {
-        info!("shutdown storage");
-        if self.memtable.len() > 0 {
-            let mut memtable = Memtable::new(0);
+    /// flush memtable into imemtable
+    pub fn flush_memtable(&mut self) {
+        if !self.memtable.is_empty() {
+            let new_seq = self.manifest.allocate_sst_sequence();
+            let mut memtable = Memtable::new(new_seq);
             swap(&mut memtable, &mut self.memtable);
+
+            if let Some(wal) = &mut self.wal {
+                wal.rotate(new_seq);
+            }
 
             let table = self.imemtables.push(Imemtable::new(
                 memtable,
@@ -314,7 +289,9 @@ impl Storage {
             ));
             self.serializer.compact_async(table);
         }
+    }
 
+    pub fn flush_imemtables(&mut self) {
         while !self.imemtables.empty() {
             if let Ok((table, meta)) = self.commit_rx.recv() {
                 if let Some(wal) = &mut self.wal {
@@ -327,6 +304,32 @@ impl Storage {
                 panic!("");
             }
         }
+    }
+}
+
+impl Storage {
+    fn rotate(&mut self) {
+        if self.memtable.is_empty() {
+            return;
+        }
+        self.flush_memtable();
+
+        // check imemtables
+        while let Ok((table, meta)) = self.commit_rx.try_recv() {
+            if let Some(wal) = &mut self.wal {
+                wal.remove(table.seq());
+            }
+
+            self.imemtables.commit(table);
+            self.manifest.add_sst(meta);
+        }
+    }
+
+    fn shutdown(&mut self) {
+        info!("shutdown storage");
+
+        self.flush_memtable();
+        self.flush_imemtables();
 
         self.serializer.stop();
         self.manifest.flush();

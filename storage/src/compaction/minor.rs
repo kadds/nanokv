@@ -2,6 +2,7 @@ use std::{
     cell::UnsafeCell,
     sync::{mpsc, Arc},
     thread::{self, JoinHandle},
+    time::Instant,
 };
 
 use log::info;
@@ -62,13 +63,15 @@ impl MinorSerializer {
                 None => break,
             };
             let meta = {
+                let beg = Instant::now();
                 let seq = table.seq();
-                let iter = table.entry_iter().filter(|entry| !entry.deleted());
+                let iter = table.entry_iter();
                 let mut sst = sst::raw_sst::RawSSTWriter::new(sst_name(&conf.path, 0, table.seq()));
 
                 let meta = sst.write(0, seq, iter);
 
-                info!("sst {} done", seq);
+                let end = Instant::now();
+                info!("sst {} done, cost {}ms", seq, (end - beg).as_millis());
                 meta
             };
             self.commit_tx.send((table, Arc::new(meta))).unwrap();

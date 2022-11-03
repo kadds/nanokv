@@ -121,7 +121,7 @@ impl Memtable {
     }
 }
 
-fn map_bound<'a, T>(b: &'a Bound<T>) -> Bound<&'a T> {
+fn map_bound<T>(b: &Bound<T>) -> Bound<&T> {
     use std::ops::Bound::*;
     unsafe {
         match b {

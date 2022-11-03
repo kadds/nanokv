@@ -83,7 +83,7 @@ impl RawSSTReader {
         if meta.magic != RAWSST_MAGIC {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "magic invalid"));
         }
-        log::info!("{:?}", meta);
+        log::info!("read meta {:?}", meta);
 
         Ok(Self {
             inner: RawSSTReaderInner {

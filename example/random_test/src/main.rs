@@ -41,6 +41,7 @@ fn main() {
 
     let config = Box::leak(config);
 
+    Instance::clean(config);
     let mut ins = Instance::new(config);
 
     let total_test: usize = 100_000;
@@ -93,11 +94,27 @@ fn main() {
         }
     }
 
+    info!("check exist keys");
+
     for key in &exist_keys {
-        assert!(ins
-            .mut_storage()
-            .get(&GetOption::default(), key.clone())
-            .is_some())
+        assert!(
+            ins.mut_storage()
+                .get(&GetOption::default(), key.clone())
+                .is_some(),
+            "{} should be exist",
+            key.clone()
+        )
+    }
+
+    info!("check del keys");
+    for key in &del_keys {
+        assert!(
+            ins.mut_storage()
+                .get(&GetOption::default(), key.clone())
+                .is_none(),
+            "{} should be deleted",
+            key.clone()
+        )
     }
 
     let iter = ins.mut_storage().scan(&GetOption::default(), ..);

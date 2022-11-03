@@ -20,6 +20,10 @@ impl Instance {
         }
     }
 
+    pub fn clean(conf: ConfigRef) {
+        fs::remove_dir_all(&conf.path).unwrap();
+    }
+
     pub fn storage(&self) -> &Storage {
         &self.storage
     }
