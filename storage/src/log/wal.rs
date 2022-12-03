@@ -1,23 +1,28 @@
 use std::{
+    fs::{self, File},
     io::{self, Write},
     marker::PhantomData,
+    path::PathBuf,
 };
 
 use byteorder::{WriteBytesExt, LE};
 use bytes::BufMut;
 use log::info;
 
-use crate::util::crc_mask;
+use crate::{util::crc::crc_mask, ConfigRef};
 
-use super::{LogEntrySerializer, LogFile, LogSegmentFlags, SEGMENT_CONTENT_SIZE};
+use super::{LogEntrySerializer, LogSegmentFlags, SEGMENT_CONTENT_SIZE};
 
-const DEFAULT_ALLOC_SIZE: usize = 1024 * 1024 * 5;
+const DEFAULT_ALLOC_SIZE: u64 = 1024 * 1024 * 5; // 5MB
+const DETAIL_ALLOC_SIZE: u64 = 1024 * 1024 * 5; // 5MB
+
 pub struct LogWriter<E, S> {
-    current: LogFile,
+    current: File,
+    config: ConfigRef,
+
     seq: u64,
-    prefix: String,
-    last_size: usize,
     write_bytes: u64,
+    name_fn: Box<dyn Fn(ConfigRef, u64) -> PathBuf + 'static + Send + Sync>,
 
     serializer: S,
 
@@ -28,12 +33,20 @@ impl<E, S> LogWriter<E, S>
 where
     S: LogEntrySerializer<Entry = E>,
 {
-    pub fn new(serializer: S, seq: u64, prefix: String) -> Self {
+    pub fn new(
+        config: ConfigRef,
+        serializer: S,
+        seq: u64,
+        name_fn: Box<dyn Fn(ConfigRef, u64) -> PathBuf + 'static + Send + Sync>,
+    ) -> Self {
+        let current = File::create(name_fn(config, seq)).unwrap();
+        current.set_len(DEFAULT_ALLOC_SIZE);
+
         Self {
-            current: LogFile::new(seq, DEFAULT_ALLOC_SIZE, &prefix),
+            current,
+            config,
+            name_fn,
             seq,
-            prefix,
-            last_size: DEFAULT_ALLOC_SIZE,
             write_bytes: 0,
             serializer,
             _pd: PhantomData::default(),
@@ -46,8 +59,7 @@ where
     S: LogEntrySerializer<Entry = E>,
 {
     pub fn append(&mut self, entry: &E) {
-        let file = self.current.file();
-        let mut file_writer = io::BufWriter::new(file);
+        let mut file_writer = io::BufWriter::new(&self.current);
         {
             let mut w = Vec::with_capacity(SEGMENT_CONTENT_SIZE).writer();
 
@@ -92,19 +104,22 @@ where
     }
 
     pub fn sync(&mut self) {
-        self.current.file().sync_data().unwrap();
+        self.current.sync_data().unwrap();
     }
 
     pub fn rotate(&mut self, seq: u64) {
         self.sync();
 
         self.seq = seq;
-        self.current = LogFile::new(self.seq, self.last_size, &self.prefix);
-        info!("wal rotate to {}{}", self.prefix, seq);
+        self.current = File::create((self.name_fn)(self.config, seq)).unwrap();
+        self.current.set_len(DEFAULT_ALLOC_SIZE);
+
+        info!("wal rotate to {}", seq);
     }
 
     pub fn remove(&self, seq: u64) {
-        LogFile::remove(seq, &self.prefix);
+        let name = (self.name_fn)(self.config, seq);
+        fs::remove_file(name);
     }
 
     #[allow(unused)]

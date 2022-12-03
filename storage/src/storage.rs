@@ -3,6 +3,7 @@ use std::{
     fs,
     mem::swap,
     ops::RangeBounds,
+    path::PathBuf,
     sync::{mpsc, Arc},
     time::Duration,
 };
@@ -16,6 +17,7 @@ use crate::{
     iterator::{MergedIter, ScanIter},
     kv::{manifest::FileMetaData, sst::SnapshotTable},
     log::LogReplayer,
+    util::fname,
     GetOption, WriteOption,
 };
 use crate::{
@@ -96,12 +98,9 @@ pub struct Storage {
 }
 
 impl Storage {
-    pub fn new(config: ConfigRef, manifest: Arc<Manifest>) -> Self {
+    pub(crate) fn new(config: ConfigRef, manifest: Arc<Manifest>) -> Self {
         let mut imemtables = Imemtables::new(config);
         let (commit_tx, commit_rx) = mpsc::sync_channel(20);
-        let wal_path = format!("{}/wal/", config.path);
-        fs::create_dir_all(&wal_path).unwrap();
-        crate::kv::sst::prepare_sst_dir(&config.path);
 
         let log_serializer = KvEntryLogSerializer::default();
         let serializer = MinorSerializer::new(config.clone(), manifest.clone(), commit_tx);
@@ -111,7 +110,8 @@ impl Storage {
             restore_seq -= 1;
             let log_serializer = KvEntryLogSerializer::default();
             let mut memtable = Memtable::new(restore_seq);
-            memtable = LogReplayer::new(log_serializer, restore_seq, &wal_path)
+
+            memtable = LogReplayer::new(log_serializer, fname::wal_name(config, restore_seq))
                 .execute(memtable, |state, entry| {
                     state.set(&WriteOption::default(), entry).unwrap()
                 });
@@ -135,7 +135,12 @@ impl Storage {
         let wal = if config.no_wal {
             None
         } else {
-            Some(LogWriter::new(log_serializer, seq, wal_path))
+            Some(LogWriter::new(
+                config,
+                log_serializer,
+                seq,
+                Box::new(fname::wal_name),
+            ))
         };
 
         Self {
@@ -271,9 +276,11 @@ impl Storage {
 
         Ok(cur_ver)
     }
+}
 
+impl Storage {
     /// flush memtable into imemtable
-    pub fn flush_memtable(&mut self) {
+    pub(crate) fn flush_memtable(&mut self) {
         if !self.memtable.is_empty() {
             let new_seq = self.manifest.allocate_sst_sequence();
             let mut memtable = Memtable::new(new_seq);
@@ -291,7 +298,7 @@ impl Storage {
         }
     }
 
-    pub fn flush_imemtables(&mut self) {
+    pub(crate) fn flush_imemtables(&mut self) {
         while !self.imemtables.empty() {
             if let Ok((table, meta)) = self.commit_rx.recv() {
                 if let Some(wal) = &mut self.wal {
@@ -305,9 +312,7 @@ impl Storage {
             }
         }
     }
-}
 
-impl Storage {
     fn rotate(&mut self) {
         if self.memtable.is_empty() {
             return;

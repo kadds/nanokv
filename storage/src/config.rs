@@ -2,10 +2,11 @@ use serde_derive::Deserialize;
 use serde_derive::Serialize;
 use std::fs::File;
 use std::io::Read;
+use std::path::PathBuf;
 
 #[derive(Deserialize, Serialize, Debug)]
 pub struct Config {
-    pub path: String,
+    pub path: PathBuf,
     pub no_wal: bool,
 }
 
@@ -23,7 +24,7 @@ pub fn load_config() -> Box<Config> {
 
 pub fn test_config() -> Box<Config> {
     let cfg = Config {
-        path: "/tmp/nanokv/".to_owned(),
+        path: "/tmp/nanokv/".into(),
         no_wal: false,
     };
     cfg.into()
@@ -31,7 +32,7 @@ pub fn test_config() -> Box<Config> {
 
 pub fn current_config() -> Box<Config> {
     let cfg = Config {
-        path: "./nanokv_data/".to_owned(),
+        path: "./nanokv_data/".into(),
         no_wal: false,
     };
     cfg.into()

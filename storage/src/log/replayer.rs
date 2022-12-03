@@ -1,17 +1,19 @@
 use std::{
+    fs::File,
     io::{BufReader, Read},
     marker::PhantomData,
+    path::PathBuf,
 };
 
 use byteorder::{ReadBytesExt, LE};
 use bytes::Buf;
 
-use crate::util::crc_unmask;
+use crate::util::crc::crc_unmask;
 
-use super::{LogEntrySerializer, LogFile, LogSegmentFlags, SEGMENT_CONTENT_SIZE};
+use super::{LogEntrySerializer, LogSegmentFlags, SEGMENT_CONTENT_SIZE};
 
 pub struct LogReplayer<E, S> {
-    current: Option<LogFile>,
+    current: Option<File>,
 
     serializer: S,
     _pd: PhantomData<E>,
@@ -21,11 +23,10 @@ impl<E, S> LogReplayer<E, S>
 where
     S: LogEntrySerializer<Entry = E>,
 {
-    pub fn new<P: Into<String>>(serializer: S, seq: u64, path: P) -> Self {
-        let path: String = path.into();
-        let log_file = LogFile::open(seq, &path);
+    pub fn new(serializer: S, path: PathBuf) -> Self {
+        let current = File::open(path).ok();
         Self {
-            current: log_file,
+            current,
 
             serializer,
             _pd: PhantomData::default(),
@@ -36,7 +37,7 @@ where
         F: FnMut(&mut ST, E),
     {
         let file = match &mut self.current {
-            Some(file) => file.file(),
+            Some(file) => file,
             None => return init_state,
         };
         let mut file_reader = BufReader::new(file);

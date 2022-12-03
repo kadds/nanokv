@@ -148,6 +148,12 @@ impl<T> Iterator for ScanIter<T> {
     }
 }
 
+impl<T> Drop for ScanIter<T> {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take() {}
+    }
+}
+
 pub trait EqualKey {
     fn equal_key(&self, other: &Self) -> bool;
 }

@@ -8,7 +8,8 @@ mod log;
 pub mod option;
 pub mod snapshot;
 pub mod storage;
-mod util;
+pub mod util;
+
 pub mod value;
 pub type Config = config::Config;
 pub type ConfigRef = config::ConfigRef;

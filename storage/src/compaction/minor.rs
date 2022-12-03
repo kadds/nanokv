@@ -10,17 +10,14 @@ use log::info;
 use crate::{
     kv::{
         manifest::{FileMetaData, Manifest},
-        sst::{self, sst_name, SSTWriter},
+        sst::{self, SSTWriter},
         Imemtable,
     },
+    util::fname,
     ConfigRef,
 };
 
 use super::CompactSerializer;
-
-pub trait TableGetter {
-    fn get(&self) -> &Imemtable;
-}
 
 pub struct MinorSerializer {
     thread: UnsafeCell<Option<JoinHandle<()>>>,
@@ -66,7 +63,7 @@ impl MinorSerializer {
                 let beg = Instant::now();
                 let seq = table.seq();
                 let iter = table.entry_iter();
-                let mut sst = sst::raw_sst::RawSSTWriter::new(sst_name(&conf.path, 0, table.seq()));
+                let mut sst = sst::raw_sst::RawSSTWriter::new(fname::sst_name(conf, table.seq()));
 
                 let meta = sst.write(0, seq, iter);
 

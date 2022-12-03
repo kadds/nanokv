@@ -1,6 +1,7 @@
 use std::{
     fs::{self, File},
     io::{Read, Write},
+    path::PathBuf,
 };
 
 pub mod replayer;
@@ -9,11 +10,6 @@ use bitflags::bitflags;
 use byteorder::{ReadBytesExt, WriteBytesExt, LE};
 pub use replayer::LogReplayer;
 pub use wal::LogWriter;
-
-pub struct LogFile {
-    file: File,
-    _name: String,
-}
 
 const SEGMENT_SIZE: usize = 1024 * 32; // 32k
 const SEGMENT_CONTENT_SIZE: usize = SEGMENT_SIZE - 4 - 2 - 1;
@@ -30,35 +26,6 @@ bitflags! {
         const BEGIN_FRAGMENT = 0b010;
         const MIDDLE_FRAGMENT = 0b011;
         const LAST_FRAGMENT = 0b100;
-    }
-}
-
-impl LogFile {
-    pub fn new(seq: u64, alloc_size: usize, prefix: &str) -> Self {
-        let name = format!("{}{}.log", prefix, seq);
-        let file = File::create(&name).unwrap();
-        file.set_len(alloc_size as u64).unwrap();
-        Self { file, _name: name }
-    }
-
-    pub fn open(seq: u64, path: &str) -> Option<Self> {
-        let name = format!("{}/{}.log", path, seq);
-        let file = File::open(&name).ok()?;
-        Some(Self { file, _name: name })
-    }
-
-    pub fn file(&mut self) -> &mut File {
-        &mut self.file
-    }
-
-    pub fn remove(seq: u64, path: &str) {
-        let name = format!("{}/{}.log", path, seq);
-        let _ = fs::remove_file(&name);
-    }
-
-    #[allow(unused)]
-    fn make_sure(&mut self, alloc_size: usize) {
-        self.file.set_len(alloc_size as u64).unwrap();
     }
 }
 

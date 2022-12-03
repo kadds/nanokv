@@ -25,17 +25,6 @@ pub trait SSTWriter {
         I: Iterator<Item = &'a KvEntry>;
 }
 
-pub(crate) fn prepare_sst_dir(base: &str) {
-    for level in 0..MAX_LEVEL {
-        let parent = format!("{}/sst/{}", base, level);
-        fs::create_dir_all(parent).unwrap();
-    }
-}
-
-pub fn sst_name(base: &str, level: u32, seq: u64) -> PathBuf {
-    format!("{}/sst/{}/{}.sst", base, level, seq).into()
-}
-
 pub trait SSTReader {
     fn get(&self, opt: &crate::GetOption, key: bytes::Bytes) -> Option<crate::Value>;
     fn scan(

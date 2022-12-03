@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 use lru::LruCache;
 
 use crate::{
-    kv::sst::{raw_sst::RawSSTReader, sst_name, SSTReader},
+    kv::sst::{raw_sst::RawSSTReader, SSTReader},
+    util::fname,
     ConfigRef,
 };
 
@@ -23,12 +24,12 @@ impl Cache {
 
 impl Cache {
     pub fn get_opened_sst(&self, level: u32, seq: u64) -> Arc<dyn SSTReader> {
+        let sst_path = fname::sst_name(self.config, seq);
+
         self.opened_sst
             .lock()
             .unwrap()
-            .get_or_insert(seq, || {
-                Arc::new(RawSSTReader::new(sst_name(&self.config.path, level, seq)).unwrap())
-            })
+            .get_or_insert(seq, || Arc::new(RawSSTReader::new(sst_path).unwrap()))
             .clone()
     }
 }

@@ -86,15 +86,9 @@ fn main() {
                     .unwrap();
             }
         }
-
-        let p = i / (total_test / 100);
-
-        if i % (total_test / 100) == 0 {
-            info!("finish {}%", p)
-        }
     }
 
-    info!("check exist keys");
+    println!("check exist keys");
 
     for key in &exist_keys {
         assert!(
@@ -106,7 +100,7 @@ fn main() {
         )
     }
 
-    info!("check del keys");
+    println!("check del keys");
     for key in &del_keys {
         assert!(
             ins.mut_storage()
