@@ -32,7 +32,7 @@ pub fn test_config() -> Box<Config> {
 
 pub fn current_config() -> Box<Config> {
     let cfg = Config {
-        path: "./nanokv_data/".into(),
+        path: "nanokv_data/".into(),
         no_wal: false,
     };
     cfg.into()

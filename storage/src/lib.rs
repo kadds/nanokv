@@ -4,7 +4,7 @@ pub mod config;
 pub mod instance;
 pub mod iterator;
 pub mod kv;
-mod log;
+pub mod log;
 pub mod option;
 pub mod snapshot;
 pub mod storage;
@@ -72,6 +72,6 @@ mod test {
     #[allow(unused)]
     pub fn init_itable() -> (Vec<(String, u64)>, Imemtable, u64) {
         let (sorted_input, table, ver) = crate::test::init_table();
-        (sorted_input, Imemtable::new(table, 0), ver)
+        (sorted_input, Imemtable::new(&table, 0), ver)
     }
 }

@@ -3,7 +3,8 @@ use bytes::{Buf, Bytes};
 use integer_encoding::{VarIntReader, VarIntWriter};
 use log::info;
 
-use crate::iterator::{EqualFilter, IteratorContext, ScanIter};
+use crate::iterator::{EqualFilter, ScanIter};
+use crate::kv::superversion::Lifetime;
 use crate::kv::{kv_entry_to_value, KvEntry};
 use crate::value::Value;
 use crate::KvIterator;
@@ -60,10 +61,6 @@ struct RawSSTReaderInner {
     size: u64,
     meta: RawSSTMetaInfo,
     seq: u64,
-}
-
-impl IteratorContext for RawSSTReaderInner {
-    fn release(&mut self) {}
 }
 
 pub struct RawSSTReader {
@@ -181,7 +178,12 @@ impl RawSSTReaderInner {
 }
 
 impl SSTReader for RawSSTReader {
-    fn get(&self, opt: &crate::GetOption, key: Bytes) -> Option<Value> {
+    fn get<'a>(
+        &self,
+        opt: &crate::GetOption,
+        key: Bytes,
+        lifetime: &Lifetime<'a>,
+    ) -> Option<Value> {
         let ver = opt.snapshot().map(|v| v.version()).unwrap_or(u64::MAX);
         let mut index = self.inner.lower_bound(&key);
         loop {
@@ -202,12 +204,13 @@ impl SSTReader for RawSSTReader {
         None
     }
 
-    fn scan(
+    fn scan<'a>(
         &self,
         opt: &crate::GetOption,
         beg: std::ops::Bound<bytes::Bytes>,
         end: std::ops::Bound<bytes::Bytes>,
-    ) -> ScanIter<(bytes::Bytes, crate::Value)> {
+        _mark: &Lifetime<'a>,
+    ) -> ScanIter<'a, (bytes::Bytes, crate::Value)> {
         let beg = match beg {
             std::ops::Bound::Included(val) => self.inner.lower_bound(&val),
             std::ops::Bound::Excluded(val) => self.inner.upper_bound(&val),
@@ -233,9 +236,9 @@ impl SSTReader for RawSSTReader {
         if let Some(snapshot) = opt.snapshot() {
             let snapshot_ver = snapshot.version();
             let iter = iter.filter(move |entry| entry.version() <= snapshot_ver);
-            ScanIter::new(EqualFilter::new(iter).map(kv_entry_to_value)).with(self.inner.clone())
+            ScanIter::new(EqualFilter::new(iter).map(kv_entry_to_value))
         } else {
-            ScanIter::new(EqualFilter::new(iter).map(kv_entry_to_value)).with(self.inner.clone())
+            ScanIter::new(EqualFilter::new(iter).map(kv_entry_to_value))
         }
     }
 }

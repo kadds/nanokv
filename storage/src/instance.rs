@@ -1,16 +1,23 @@
 use std::{
     fs,
     path::{Component, PathBuf},
-    sync::Arc,
+    sync::{atomic::AtomicU64, Arc},
 };
 
 use log::info;
 
-use crate::{compaction, config::ConfigRef, kv::manifest::Manifest, storage::Storage, util::fname};
+use crate::{
+    compaction,
+    config::ConfigRef,
+    kv::{manifest::Manifest, superversion::SuperVersion},
+    storage::Storage,
+    util::fname,
+};
 
 #[allow(unused)]
 pub struct Instance {
     manifest: Arc<Manifest>,
+
     storage: Storage,
     conf: ConfigRef,
     serializer: Arc<compaction::major::MajorSerializer>,
@@ -21,8 +28,6 @@ impl Instance {
         let dir = std::env::current_dir().unwrap();
         info!("cwd {}", dir.to_str().unwrap());
         fname::make_sure(conf);
-
-        fs::create_dir_all(&conf.path).unwrap();
         fs::File::create(PathBuf::from(&conf.path).join("nanokv")).unwrap();
 
         let manifest = Arc::new(Manifest::new(conf.clone()));

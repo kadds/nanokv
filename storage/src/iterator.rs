@@ -1,4 +1,4 @@
-use std::{collections::BinaryHeap, sync::Arc};
+use std::{collections::BinaryHeap, marker::PhantomData, sync::Arc};
 
 use bytes::Bytes;
 
@@ -49,18 +49,18 @@ where
     }
 }
 
-pub struct MergedIter<T> {
-    iters: Vec<ScanIter<T>>,
+pub struct MergedIter<'a, T> {
+    iters: Vec<ScanIter<'a, T>>,
     heap: BinaryHeap<MergedItem<T>>,
     last_key: Option<Bytes>,
     init: bool,
 }
 
-impl<T> MergedIter<T>
+impl<'a, T> MergedIter<'a, T>
 where
     T: KvIteratorItem,
 {
-    pub fn new(iters: Vec<ScanIter<T>>) -> Self {
+    pub fn new(iters: Vec<ScanIter<'a, T>>) -> Self {
         Self {
             iters,
             heap: BinaryHeap::new(),
@@ -70,14 +70,14 @@ where
     }
 }
 
-impl<T> KvIterator for MergedIter<T>
+impl<'a, T> KvIterator for MergedIter<'a, T>
 where
     T: KvIteratorItem,
 {
     fn prefetch(&mut self, _n: usize) {}
 }
 
-impl<T> Iterator for MergedIter<T>
+impl<'a, T> Iterator for MergedIter<'a, T>
 where
     T: KvIteratorItem,
 {
@@ -113,44 +113,30 @@ where
     }
 }
 
-pub trait IteratorContext {
-    fn release(&mut self);
+pub struct ScanIter<'a, T> {
+    inner: Box<dyn Iterator<Item = T> + 'a>,
+    _pd: PhantomData<&'a ()>,
 }
 
-pub struct ScanIter<T> {
-    inner: Box<dyn Iterator<Item = T>>,
-    state: Option<Arc<dyn IteratorContext>>,
-}
-
-impl<T> ScanIter<T> {
-    pub fn new<I: Iterator<Item = T> + 'static>(inner: I) -> Self {
+impl<'a, T> ScanIter<'a, T> {
+    pub fn new<I: Iterator<Item = T> + 'a>(inner: I) -> Self {
         Self {
             inner: Box::new(inner),
-            state: None,
+            _pd: PhantomData::default(),
         }
-    }
-    pub fn with(mut self, ctx: Arc<dyn IteratorContext>) -> Self {
-        self.state = Some(ctx);
-        self
     }
 }
 
-impl<T> KvIterator for ScanIter<T> {
+impl<'a, T> KvIterator for ScanIter<'a, T> {
     fn prefetch(&mut self, _n: usize) {}
 }
 
-impl<T> Iterator for ScanIter<T> {
+impl<'a, T> Iterator for ScanIter<'a, T> {
     type Item = T;
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         self.inner.next()
-    }
-}
-
-impl<T> Drop for ScanIter<T> {
-    fn drop(&mut self) {
-        if let Some(state) = self.state.take() {}
     }
 }
 

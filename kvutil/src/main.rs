@@ -1,8 +1,17 @@
-use std::path::PathBuf;
+use std::{fmt::Write, fs::File, io::Read, path::PathBuf};
 
 use bytes::Bytes;
 use clap::Parser;
-use storage::{kv::sst::SSTReader, GetOption};
+use opt::ManifestCommands;
+use storage::{
+    kv::{
+        manifest::{ManifestLogSerializer, Version, VersionSet},
+        sst::SSTReader,
+        superversion::Lifetime,
+    },
+    log::LogReplayer,
+    GetOption,
+};
 mod opt;
 
 fn main() {
@@ -10,7 +19,7 @@ fn main() {
     let base = cli.path.unwrap_or_else(|| "./".to_owned());
     match cli.command {
         opt::Commands::Sst { subcommand, file } => sst(base, subcommand, file),
-        opt::Commands::Manifest => manifest(),
+        opt::Commands::Manifest { subcommand } => manifest(base, subcommand),
         opt::Commands::Wal => wal(),
         opt::Commands::Db => db(),
     };
@@ -39,10 +48,12 @@ fn sst_summary(path: PathBuf) {
 
 fn sst_dump(path: PathBuf, noval: bool) {
     let reader = storage::kv::sst::raw_sst::RawSSTReader::new(path).unwrap();
+    let lifetime = Lifetime::default();
     let iter = reader.scan(
         &GetOption::default(),
         std::ops::Bound::Unbounded,
         std::ops::Bound::Unbounded,
+        &lifetime,
     );
     for (key, value) in iter {
         print_item(key, value, noval)
@@ -51,10 +62,12 @@ fn sst_dump(path: PathBuf, noval: bool) {
 
 fn sst_get(path: PathBuf, key: Bytes, noval: bool) {
     let reader = storage::kv::sst::raw_sst::RawSSTReader::new(path).unwrap();
+    let lifetime = Lifetime::default();
     let iter = reader.scan(
         &GetOption::default(),
         std::ops::Bound::Included(key.clone()),
         std::ops::Bound::Included(key),
+        &lifetime,
     );
     for (key, value) in iter {
         print_item(key, value, noval)
@@ -75,7 +88,40 @@ fn print_item(key: Bytes, mut value: storage::Value, noval: bool) {
     }
 }
 
-fn manifest() {}
+fn manifest(base: String, command: opt::ManifestCommands) {
+    match command {
+        ManifestCommands::Current => {
+            show_current(base);
+        }
+        ManifestCommands::Dump { show_step } => dump_manifest(base, show_step),
+    }
+}
+
+fn show_current(base: String) -> u64 {
+    let name = PathBuf::from(base).join("manifest").join("current");
+    let mut buf = String::new();
+    File::open(name)
+        .and_then(|mut f| f.read_to_string(&mut buf))
+        .unwrap();
+
+    println!("current {}.log", buf);
+    buf.parse().unwrap()
+}
+
+fn dump_manifest(base: String, show_step: bool) {
+    let seq = show_current(base.clone());
+    let mut name = PathBuf::from(base).join("manifest").join(seq.to_string());
+    name.set_extension("log");
+
+    let mut r = LogReplayer::new(ManifestLogSerializer::default(), name);
+    let final_state = r.execute(VersionSet::default(), |state, edit| {
+        if show_step {
+            println!("{:?}", edit);
+        }
+        state.add(&edit);
+    });
+    println!("{:?}", final_state);
+}
 
 fn wal() {}
 

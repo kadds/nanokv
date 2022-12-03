@@ -5,22 +5,14 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
+use super::superversion::{Lifetime, SuperVersion};
 use super::{GetOption, KvEntry, SetResult, WriteOption};
-use crate::iterator::{EqualFilter, IteratorContext, ScanIter};
+use crate::iterator::{EqualFilter, ScanIter};
 use crate::kv::kv_entry_ref_to_value;
 use crate::value::Value;
 
-#[derive(Debug, Default)]
-struct MeltableInner {
-    list: skiplist::OrderedSkipList<KvEntry>,
-}
-
-impl IteratorContext for MeltableInner {
-    fn release(&mut self) {}
-}
-
 pub struct Memtable {
-    inner: Arc<MeltableInner>,
+    list: skiplist::OrderedSkipList<KvEntry>,
 
     seq: u64,
 
@@ -31,7 +23,7 @@ pub struct Memtable {
 impl Memtable {
     pub fn new(seq: u64) -> Self {
         Self {
-            inner: Arc::new(MeltableInner::default()),
+            list: skiplist::OrderedSkipList::new(),
             seq,
             total_bytes: AtomicU64::new(0),
             min_ver: AtomicU64::new(0),
@@ -40,14 +32,12 @@ impl Memtable {
 
     pub fn iter<'a>(&'a self) -> impl Iterator<Item = &'a KvEntry> {
         unsafe {
-            core::mem::transmute::<_, skiplist::ordered_skiplist::Iter<'a, _>>(
-                self.inner.clone().list.iter(),
-            )
+            core::mem::transmute::<_, skiplist::ordered_skiplist::Iter<'a, _>>(self.list.iter())
         }
     }
 
     pub fn full(&self) -> bool {
-        self.inner.list.len() >= 1024 * 16
+        self.list.len() >= 1024 * 16
             || self.total_bytes.load(std::sync::atomic::Ordering::Relaxed) > 1024 * 1024 * 10
     }
 
@@ -55,17 +45,17 @@ impl Memtable {
         self.seq
     }
     pub fn len(&self) -> usize {
-        self.inner.list.len()
+        self.list.len()
     }
     pub fn is_empty(&self) -> bool {
-        self.inner.list.is_empty()
+        self.list.is_empty()
     }
 }
 
 impl Memtable {
-    pub fn get(&self, opt: &GetOption, key: Bytes) -> Option<Value> {
+    pub fn get<'a>(&self, opt: &GetOption, key: Bytes, lifetime: &Lifetime<'a>) -> Option<Value> {
         use std::ops::Bound::Included;
-        let mut iter = self.inner.list.range(
+        let mut iter = self.list.range(
             Included(&KvEntry::from_search(key.to_owned(), u64::MAX)),
             Included(&KvEntry::from_search(key.to_owned(), 0)),
         );
@@ -84,11 +74,12 @@ impl Memtable {
         None
     }
 
-    pub fn scan(
+    pub fn scan<'a, R: RangeBounds<Bytes> + Clone>(
         &self,
         opt: &GetOption,
-        range: impl RangeBounds<Bytes> + Clone,
-    ) -> ScanIter<(Bytes, Value)> {
+        range: R,
+        lifetime: &Lifetime<'a>, // lifetime parameter
+    ) -> ScanIter<'a, (Bytes, Value)> {
         use std::ops::Bound::*;
         let beg = match range.start_bound() {
             Included(val) => Included(KvEntry::from_search(val.to_owned(), u64::MAX)),
@@ -104,19 +95,17 @@ impl Memtable {
         let beg = map_bound(&beg);
         let end = map_bound(&end);
 
-        let inner = self.inner.clone();
-
         let iter = unsafe {
             core::mem::transmute::<_, skiplist::ordered_skiplist::Iter<'static, KvEntry>>(
-                inner.list.range(beg, end),
+                self.list.range(beg, end),
             )
         };
         if let Some(snapshot) = opt.snapshot() {
             let snapshot_ver = snapshot.version();
             let iter = iter.filter(move |entry| entry.version() <= snapshot_ver);
-            ScanIter::new(EqualFilter::new(iter).map(kv_entry_ref_to_value)).with(inner)
+            ScanIter::new(EqualFilter::new(iter).map(kv_entry_ref_to_value))
         } else {
-            ScanIter::new(EqualFilter::new(iter).map(kv_entry_ref_to_value)).with(inner)
+            ScanIter::new(EqualFilter::new(iter).map(kv_entry_ref_to_value))
         }
     }
 }
@@ -134,13 +123,13 @@ fn map_bound<T>(b: &Bound<T>) -> Bound<&T> {
 
 impl Memtable {
     pub fn set(&self, _opt: &WriteOption, entry: KvEntry) -> SetResult<()> {
-        if self.inner.list.is_empty() {
+        if self.list.is_empty() {
             self.min_ver
                 .store(entry.version(), std::sync::atomic::Ordering::Release);
         }
         self.total_bytes
             .fetch_add(entry.bytes(), std::sync::atomic::Ordering::AcqRel);
-        let l = &self.inner.list as *const skiplist::OrderedSkipList<KvEntry>;
+        let l = &self.list as *const skiplist::OrderedSkipList<KvEntry>;
         unsafe {
             let l = (l as *mut skiplist::OrderedSkipList<KvEntry>)
                 .as_mut()
@@ -161,59 +150,68 @@ mod test {
         let (sorted_input, table, ver) = crate::test::init_table();
 
         let opt = GetOption::default();
+        let lifetime = Lifetime::default();
 
         // basic get
         assert_eq!(
-            table.get(&opt, "101".into()).unwrap().version(),
+            table.get(&opt, "101".into(), &lifetime).unwrap().version(),
             sorted_input[1].1
         );
 
         // multi-version get
-        let v3 = table.get(&opt, "133".into());
+        let v3 = table.get(&opt, "133".into(), &lifetime);
         assert_eq!(v3.unwrap().version(), ver - 3);
 
         // get snapshot
         let v3 = table.get(
             &GetOption::with_snapshot(sorted_input[33].1 + 1),
             "133".into(),
+            &lifetime,
         );
         assert_eq!(v3.unwrap().version(), sorted_input[33].1);
-        let v3 = table.get(&GetOption::with_snapshot(sorted_input[33].1), "133".into());
+        let v3 = table.get(
+            &GetOption::with_snapshot(sorted_input[33].1),
+            "133".into(),
+            &lifetime,
+        );
         assert_eq!(v3.unwrap().version(), sorted_input[33].1);
 
         // get deleted
-        let v4 = table.get(&opt, "144".into());
+        let v4 = table.get(&opt, "144".into(), &lifetime);
         assert!(v4.unwrap().deleted());
 
-        let v4 = table.get(&GetOption::with_snapshot(ver - 2), "144".into());
+        let v4 = table.get(&GetOption::with_snapshot(ver - 2), "144".into(), &lifetime);
         assert_eq!(v4.unwrap().version(), ver - 4);
 
-        let v4 = table.get(&GetOption::with_snapshot(ver - 5), "144".into());
+        let v4 = table.get(&GetOption::with_snapshot(ver - 5), "144".into(), &lifetime);
         assert_eq!(v4.unwrap().version(), sorted_input[44].1);
 
         // set & delete & set
 
-        let v5 = table.get(&GetOption::with_snapshot(ver - 2), "155".into());
+        let v5 = table.get(&GetOption::with_snapshot(ver - 2), "155".into(), &lifetime);
         assert!(v5.unwrap().deleted());
 
         // scan tables
         assert_eq!(
             table
-                .scan(&opt, Bytes::from("100")..=Bytes::from("110"))
+                .scan(&opt, Bytes::from("100")..=Bytes::from("110"), &lifetime)
                 .count(),
             11
         );
 
         // full scan
-        assert_eq!(table.scan(&opt, ..).count(), 200);
+        assert_eq!(table.scan(&opt, .., &lifetime).count(), 200);
         // filter deleted
         assert_eq!(
-            table.scan(&opt, ..).filter(|(_, v)| !v.deleted()).count(),
+            table
+                .scan(&opt, .., &lifetime)
+                .filter(|(_, v)| !v.deleted())
+                .count(),
             199
         );
 
         // scan all
-        for (idx, entry) in table.scan(&opt, ..).enumerate() {
+        for (idx, entry) in table.scan(&opt, .., &lifetime).enumerate() {
             assert_eq!(sorted_input[idx].0, entry.0);
         }
     }
@@ -227,6 +225,7 @@ mod test {
             .set(&WriteOption::default(), KvEntry::new("0", "1", None, ver))
             .unwrap();
 
-        assert!(table.get(&opt, "0".into()).is_some());
+        let lifetime = Lifetime::default();
+        assert!(table.get(&opt, "0".into(), &lifetime).is_some());
     }
 }

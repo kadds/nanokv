@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, LinkedList},
     fs::{self, File},
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
@@ -176,6 +176,7 @@ impl LogEntrySerializer for VersionLogSerializer {
     }
 }
 
+#[derive(Debug)]
 pub enum VersionEdit {
     SSTAppended(Arc<FileMetaData>),
     SSTRemove(u64),
@@ -473,6 +474,34 @@ impl VersionSet {
     }
 }
 
+fn clear_log(config: ConfigRef, seq: u64) {
+    let path = fname::manifest_name(config, seq);
+    let parent = path.parent().unwrap();
+    info!("{:?}", parent);
+    for file in parent.read_dir().unwrap() {
+        match file {
+            Ok(file) => {
+                match file
+                    .path()
+                    .file_stem()
+                    .and_then(|n| n.to_str())
+                    .and_then(|v| v.parse::<u64>().ok())
+                {
+                    Some(v) => {
+                        if v != seq {
+                            let _ = fs::remove_file(file.path());
+                        }
+                    }
+                    None => (),
+                }
+            }
+            Err(err) => {
+                warn!("{:?} list {}", parent.as_os_str(), err)
+            }
+        }
+    }
+}
+
 pub const MAX_LEVEL: u32 = 8;
 
 pub struct Manifest {
@@ -508,6 +537,7 @@ impl Manifest {
 
         this.restore_from_wal(seq);
         this.save_current_log();
+        clear_log(config, seq + 2);
 
         this.version_set.lock().unwrap().last_manifest_seq = seq + 2;
         this.remove_unused_wal(seq + 1);
@@ -518,7 +548,7 @@ impl Manifest {
 
     pub fn load_current_log_sequence(path: &PathBuf) -> Option<u64> {
         let mut buf = String::new();
-        match File::open(path).map(|mut f| f.read_to_string(&mut buf)) {
+        match File::open(&path).map(|mut f| f.read_to_string(&mut buf)) {
             Err(e) => {
                 warn!("{:?} read {}", path.as_os_str(), e);
             }
@@ -587,7 +617,7 @@ impl Manifest {
             self.save_current_log();
         }
         {
-            let mut wal = self.wal.lock().unwrap();
+            let wal = self.wal.lock().unwrap();
             wal.remove(old_seq);
         }
     }

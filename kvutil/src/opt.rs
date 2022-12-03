@@ -29,6 +29,15 @@ pub enum SSTCommands {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum ManifestCommands {
+    Current,
+    Dump {
+        #[arg(short, long)]
+        show_step: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Load summary/dump data from sst file
     Sst {
@@ -38,7 +47,10 @@ pub enum Commands {
         file: String,
     },
     /// Load current version info from manifest log
-    Manifest,
+    Manifest {
+        #[command(subcommand)]
+        subcommand: ManifestCommands,
+    },
     /// Parse write ahead log
     Wal,
     /// Database operations like repair/summary/print

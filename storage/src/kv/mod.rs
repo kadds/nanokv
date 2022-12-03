@@ -253,3 +253,4 @@ pub mod memtable;
 pub mod sst;
 pub use imemtable::Imemtable;
 pub use memtable::Memtable;
+pub mod superversion;

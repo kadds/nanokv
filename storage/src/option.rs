@@ -5,6 +5,7 @@ pub struct GetOption {
     must_fetch_value: bool,
     snapshot: Option<Snapshot>,
     fetch_delete: bool,
+    debug: bool,
 }
 
 impl GetOption {
@@ -26,6 +27,9 @@ impl GetOption {
         self.fetch_delete = fetch;
         self
     }
+    pub fn debug(&self) -> bool {
+        self.debug
+    }
 }
 
 impl GetOption {
@@ -34,6 +38,13 @@ impl GetOption {
             must_fetch_value: false,
             snapshot: Some(snapshot.into()),
             fetch_delete: false,
+            debug: false,
+        }
+    }
+    pub fn with_debug() -> Self {
+        Self {
+            debug: true,
+            ..Default::default()
         }
     }
 }
@@ -41,10 +52,28 @@ impl GetOption {
 #[derive(Debug, Default)]
 pub struct WriteOption {
     fsync: bool,
+    debug: bool,
 }
 
 impl WriteOption {
     pub fn fsync(&self) -> bool {
         self.fsync
     }
+    pub fn debug(&self) -> bool {
+        self.debug
+    }
 }
+
+impl WriteOption {
+    pub fn with_debug() -> Self {
+        Self {
+            debug: true,
+            ..Default::default()
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct ScanOption {}
+
+impl ScanOption {}

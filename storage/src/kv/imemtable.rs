@@ -1,10 +1,14 @@
-use std::{collections::HashSet, ops::RangeBounds, sync::Arc};
+use std::{
+    collections::{HashSet, LinkedList},
+    ops::RangeBounds,
+    sync::Arc,
+};
 
 use bytes::Bytes;
 
-use super::{GetOption, KvEntry, Memtable};
+use super::{superversion::Lifetime, GetOption, KvEntry, Memtable};
 use crate::{
-    iterator::{EqualFilter, IteratorContext, ScanIter},
+    iterator::{EqualFilter, MergedIter, ScanIter},
     kv::kv_entry_ref_to_value,
     value::Value,
 };
@@ -12,19 +16,15 @@ use superslice::*;
 
 #[derive(Debug)]
 pub struct Imemtable {
-    keys: Arc<Vec<KvEntry>>,
+    keys: Vec<KvEntry>,
     seq: u64,
 
     min_ver: u64,
     max_ver: u64,
 }
 
-impl IteratorContext for Vec<KvEntry> {
-    fn release(&mut self) {}
-}
-
 impl Imemtable {
-    pub fn new(memtable: Memtable, reserved_version: u64) -> Self {
+    pub fn new(memtable: &Memtable, reserved_version: u64) -> Self {
         let seq = memtable.seq();
         let cap = memtable.len();
         let mut keys = Vec::with_capacity(cap);
@@ -57,7 +57,7 @@ impl Imemtable {
         keys = new_keys;
 
         Self {
-            keys: Arc::new(keys),
+            keys,
             seq,
             min_ver,
             max_ver,
@@ -101,7 +101,7 @@ impl Imemtable {
 }
 
 impl Imemtable {
-    pub fn get(&self, opt: &GetOption, key: Bytes) -> Option<Value> {
+    pub fn get<'a>(&self, opt: &GetOption, key: Bytes, lifetime: &Lifetime<'a>) -> Option<Value> {
         let mut range = self.keys.equal_range_by(|entry| entry.key().cmp(&key));
 
         if range.is_empty() {
@@ -121,11 +121,12 @@ impl Imemtable {
         None
     }
 
-    pub fn scan(
+    pub fn scan<'a, R: RangeBounds<Bytes> + Clone>(
         &self,
         opt: &GetOption,
-        range: impl RangeBounds<Bytes>,
-    ) -> ScanIter<(Bytes, Value)> {
+        range: R,
+        _mark: &Lifetime<'a>,
+    ) -> ScanIter<'a, (Bytes, Value)> {
         use std::ops::Bound::*;
         let beg = match range.start_bound() {
             Included(val) => self.keys.lower_bound_by(|entry| entry.key().cmp(val)),
@@ -149,10 +150,61 @@ impl Imemtable {
                 )
                 .map(kv_entry_ref_to_value),
             )
-            .with(keys)
         } else {
-            ScanIter::new(EqualFilter::new(slice.iter()).map(kv_entry_ref_to_value)).with(keys)
+            ScanIter::new(EqualFilter::new(slice.iter()).map(kv_entry_ref_to_value))
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Imemtables {
+    imemtables: LinkedList<Arc<Imemtable>>,
+}
+
+impl Imemtables {
+    pub fn new() -> Self {
+        let vec = LinkedList::new();
+        Self { imemtables: vec }
+    }
+    pub fn push(&mut self, table: Imemtable) -> Arc<Imemtable> {
+        let table = Arc::new(table);
+        self.imemtables.push_back(table.clone());
+        table
+    }
+
+    pub fn commit(&mut self, table: Arc<Imemtable>) {
+        assert!(
+            !self.imemtables.is_empty() && self.imemtables.front().unwrap().seq() == table.seq()
+        );
+        self.imemtables.pop_front();
+    }
+    pub fn empty(&self) -> bool {
+        self.imemtables.is_empty()
+    }
+}
+
+impl Imemtables {
+    pub fn get<'a>(&self, opt: &GetOption, key: Bytes, lifetime: &Lifetime<'a>) -> Option<Value> {
+        for table in self.imemtables.iter().rev() {
+            if let Some(value) = table.get(opt, key.clone(), lifetime) {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    pub fn scan<'a, R: RangeBounds<Bytes> + Clone>(
+        &self,
+        opt: &GetOption,
+        range: R,
+        lifetime: &Lifetime<'a>,
+    ) -> ScanIter<'a, (Bytes, Value)> {
+        let mut iters = Vec::new();
+        for table in self.imemtables.iter().rev() {
+            iters.push(table.scan(opt, range.clone(), lifetime));
+        }
+
+        ScanIter::new(MergedIter::new(iters))
     }
 }
 
@@ -165,59 +217,68 @@ mod test {
         let (sorted_input, table, ver) = crate::test::init_itable();
 
         let opt = GetOption::default();
+        let lifetime = Lifetime::default();
 
         // basic get
         assert_eq!(
-            table.get(&opt, "101".into()).unwrap().version(),
+            table.get(&opt, "101".into(), &lifetime).unwrap().version(),
             sorted_input[1].1
         );
 
         // multi-version get
-        let v3 = table.get(&opt, "133".into());
+        let v3 = table.get(&opt, "133".into(), &lifetime);
         assert_eq!(v3.unwrap().version(), ver - 3);
 
         // get snapshot
         let v3 = table.get(
             &GetOption::with_snapshot(sorted_input[33].1 + 1),
             "133".into(),
+            &lifetime,
         );
         assert_eq!(v3.unwrap().version(), sorted_input[33].1);
-        let v3 = table.get(&GetOption::with_snapshot(sorted_input[33].1), "133".into());
+        let v3 = table.get(
+            &GetOption::with_snapshot(sorted_input[33].1),
+            "133".into(),
+            &lifetime,
+        );
         assert_eq!(v3.unwrap().version(), sorted_input[33].1);
 
         // get deleted
-        let v4 = table.get(&opt, "144".into());
+        let v4 = table.get(&opt, "144".into(), &lifetime);
         assert!(v4.unwrap().deleted());
 
-        let v4 = table.get(&GetOption::with_snapshot(ver - 2), "144".into());
+        let v4 = table.get(&GetOption::with_snapshot(ver - 2), "144".into(), &lifetime);
         assert_eq!(v4.unwrap().version(), ver - 4);
 
-        let v4 = table.get(&GetOption::with_snapshot(ver - 5), "144".into());
+        let v4 = table.get(&GetOption::with_snapshot(ver - 5), "144".into(), &lifetime);
         assert_eq!(v4.unwrap().version(), sorted_input[44].1);
 
         // set & delete & set
 
-        let v5 = table.get(&GetOption::with_snapshot(ver - 2), "155".into());
+        let v5 = table.get(&GetOption::with_snapshot(ver - 2), "155".into(), &lifetime);
         assert!(v5.unwrap().deleted());
 
         // scan tables
         assert_eq!(
             table
-                .scan(&opt, Bytes::from("100")..=Bytes::from("110"))
+                .scan(&opt, Bytes::from("100")..=Bytes::from("110"), &lifetime)
                 .count(),
             11
         );
 
         // full scan
-        assert_eq!(table.scan(&opt, ..).count(), 200);
+        assert_eq!(table.scan(&opt, .., &lifetime).count(), 200);
         // filter deleted
         assert_eq!(
-            table.scan(&opt, ..).filter(|(_, v)| !v.deleted()).count(),
+            table
+                .scan(&opt, .., &lifetime)
+                .filter(|(_, v)| !v.deleted())
+                .count(),
             199
         );
 
         // scan all
-        for (idx, entry) in table.scan(&opt, ..).enumerate() {
+        for (idx, entry) in table.scan(&opt, .., &lifetime).enumerate() {
             assert_eq!(sorted_input[idx].0, entry.0);
         }
     }
