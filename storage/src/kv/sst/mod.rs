@@ -21,9 +21,9 @@ pub mod format;
 pub mod raw_sst;
 
 pub trait SSTWriter {
-    fn write<'a, I>(&'a mut self, level: u32, seq: u64, iter: I) -> FileMetaData
+    fn write<I>(&mut self, level: u32, seq: u64, iter: I) -> FileMetaData
     where
-        I: Iterator<Item = &'a KvEntry>;
+        I: Iterator<Item = KvEntry>;
 }
 
 pub trait SSTReader {
@@ -40,6 +40,7 @@ pub trait SSTReader {
         end: Bound<bytes::Bytes>,
         lifetime: &Lifetime<'a>,
     ) -> ScanIter<'a, (bytes::Bytes, crate::Value)>;
+    fn raw_scan<'a>(&self, lifetime: &Lifetime<'a>) -> ScanIter<'a, KvEntry>;
 }
 
 pub struct SnapshotTable<'a> {
@@ -74,18 +75,18 @@ impl<'a> SnapshotTable<'a> {
         key: bytes::Bytes,
         lifetime: &Lifetime<'b>,
     ) -> Option<crate::Value> {
-        // search from L0
+        for level in 0..MAX_LEVEL {
+            let iter = self
+                .version
+                .level_n(level)
+                .filter(|fs| fs.meta().min_ver <= self.snapshot.version())
+                .map(|fs| self.cache.get_opened_sst(fs.meta().level, fs.meta().seq));
 
-        let iter = self
-            .version
-            .level_n(0)
-            .filter(|file| file.min_ver <= self.snapshot.version())
-            .map(|file| self.cache.get_opened_sst(file.level, file.seq));
-
-        for file_reader in iter {
-            let value = file_reader.get(opt, key.clone(), lifetime);
-            if let Some(value) = value {
-                return Some(value);
+            for file_reader in iter {
+                let value = file_reader.get(opt, key.clone(), lifetime);
+                if let Some(value) = value {
+                    return Some(value);
+                }
             }
         }
 
@@ -98,22 +99,24 @@ impl<'a> SnapshotTable<'a> {
         range: R,
         lifetime: &Lifetime<'b>,
     ) -> ScanIter<'b, (bytes::Bytes, crate::Value)> {
-        // scan from L0
-        let iter = self
-            .version
-            .level_n(0)
-            .filter(|file| file.min_ver <= self.snapshot.version())
-            .map(|file| self.cache.get_opened_sst(file.level, file.seq));
-
         let mut iters = Vec::new();
-        for file_reader in iter {
-            iters.push(file_reader.scan(
-                opt,
-                range.start_bound().cloned(),
-                range.end_bound().cloned(),
-                &lifetime,
-            ));
+        for level in 0..MAX_LEVEL {
+            let iter = self
+                .version
+                .level_n(level)
+                .filter(|fs| fs.meta().min_ver <= self.snapshot.version())
+                .map(|fs| self.cache.get_opened_sst(fs.meta().level, fs.meta().seq));
+
+            for file_reader in iter {
+                iters.push(file_reader.scan(
+                    opt,
+                    range.start_bound().cloned(),
+                    range.end_bound().cloned(),
+                    &lifetime,
+                ));
+            }
         }
+
         ScanIter::new(MergedIter::new(iters))
     }
 }

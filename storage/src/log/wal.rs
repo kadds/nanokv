@@ -3,6 +3,7 @@ use std::{
     io::{self, Write},
     marker::PhantomData,
     path::PathBuf,
+    sync::Mutex,
 };
 
 use byteorder::{WriteBytesExt, LE};
@@ -16,12 +17,18 @@ use super::{LogEntrySerializer, LogSegmentFlags, SEGMENT_CONTENT_SIZE};
 const DEFAULT_ALLOC_SIZE: u64 = 1024 * 1024 * 5; // 5MB
 const DETAIL_ALLOC_SIZE: u64 = 1024 * 1024 * 5; // 5MB
 
-pub struct LogWriter<E, S> {
-    current: File,
-    config: ConfigRef,
+pub const INVALID_SEQ: u64 = u64::MAX;
 
+struct LogInner {
+    current: Option<File>,
     seq: u64,
     write_bytes: u64,
+}
+
+pub struct LogWriter<E, S> {
+    config: ConfigRef,
+    inner: Mutex<LogInner>,
+
     name_fn: Box<dyn Fn(ConfigRef, u64) -> PathBuf + 'static + Send + Sync>,
 
     serializer: S,
@@ -39,15 +46,22 @@ where
         seq: u64,
         name_fn: Box<dyn Fn(ConfigRef, u64) -> PathBuf + 'static + Send + Sync>,
     ) -> Self {
-        let current = File::create(name_fn(config, seq)).unwrap();
-        current.set_len(DEFAULT_ALLOC_SIZE);
+        let current = if seq == INVALID_SEQ {
+            None
+        } else {
+            let current = File::create(name_fn(config, seq)).unwrap();
+            current.set_len(DEFAULT_ALLOC_SIZE);
+            Some(current)
+        };
 
         Self {
-            current,
+            inner: Mutex::new(LogInner {
+                current,
+                seq,
+                write_bytes: 0,
+            }),
             config,
             name_fn,
-            seq,
-            write_bytes: 0,
             serializer,
             _pd: PhantomData::default(),
         }
@@ -58,12 +72,17 @@ impl<E, S> LogWriter<E, S>
 where
     S: LogEntrySerializer<Entry = E>,
 {
-    pub fn append(&mut self, entry: &E) {
-        let mut file_writer = io::BufWriter::new(&self.current);
+    pub fn append(&self, entry: &E) {
+        let mut inner = self.inner.lock().unwrap();
+        let bytes;
         {
+            if inner.current.is_none() {
+                return;
+            }
+            let mut file_writer = io::BufWriter::new(inner.current.as_ref().unwrap());
             let mut w = Vec::with_capacity(SEGMENT_CONTENT_SIZE).writer();
 
-            self.write_bytes += self.serializer.write(entry, &mut w);
+            bytes = self.serializer.write(entry, &mut w);
 
             let mut do_write_segment = |item: &[u8], flags| {
                 let mut crc_builder = crc32fast::Hasher::new();
@@ -101,18 +120,21 @@ where
 
             file_writer.flush().unwrap();
         }
+        inner.write_bytes = bytes;
     }
 
-    pub fn sync(&mut self) {
-        self.current.sync_data().unwrap();
+    pub fn sync(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.current.as_mut().map(|f| f.sync_data().unwrap());
     }
 
-    pub fn rotate(&mut self, seq: u64) {
-        self.sync();
+    pub fn rotate(&self, seq: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.current.as_mut().map(|f| f.sync_data().unwrap());
 
-        self.seq = seq;
-        self.current = File::create((self.name_fn)(self.config, seq)).unwrap();
-        self.current.set_len(DEFAULT_ALLOC_SIZE);
+        inner.seq = seq;
+        inner.current = Some(File::create((self.name_fn)(self.config, seq)).unwrap());
+        inner.current.as_mut().unwrap().set_len(DEFAULT_ALLOC_SIZE);
 
         info!("wal rotate to {}", seq);
     }
@@ -122,12 +144,8 @@ where
         fs::remove_file(name);
     }
 
-    #[allow(unused)]
-    pub fn bytes(&self) -> u64 {
-        self.write_bytes
-    }
-
     pub fn seq(&self) -> u64 {
-        self.seq
+        let inner = self.inner.lock().unwrap();
+        inner.seq
     }
 }

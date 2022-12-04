@@ -1,9 +1,13 @@
 use std::{
     collections::{BTreeMap, HashMap, LinkedList},
+    fmt::Debug,
     fs::{self, File},
     io::{Read, Write},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU32, AtomicU8, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use ::log::{error, info, warn};
@@ -20,7 +24,7 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct Run {
-    files: Vec<Arc<FileMetaData>>,
+    files: Vec<Arc<FileStatistics>>,
     min: Bytes,
     max: Bytes,
 }
@@ -34,18 +38,18 @@ impl Run {
         }
     }
 
-    pub fn push(&mut self, sst: Arc<FileMetaData>) {
+    pub fn push(&mut self, sst: Arc<FileStatistics>) {
         if self.min.len() == 0 {
-            self.min = sst.min.clone();
+            self.min = sst.meta.min.clone();
         } else {
-            self.min = self.min.clone().min(sst.min.clone());
+            self.min = self.min.clone().min(sst.meta.min.clone());
         }
         if self.max.len() == 0 {
-            self.max = sst.max.clone();
+            self.max = sst.meta.max.clone();
         } else {
-            self.max = self.max.clone().max(sst.max.clone());
+            self.max = self.max.clone().max(sst.meta.max.clone());
         }
-        let idx = self.files.lower_bound_by(|f| f.max.cmp(&sst.min));
+        let idx = self.files.lower_bound_by(|f| f.meta.min.cmp(&sst.meta.max));
         if idx >= self.files.len() {
             self.files.push(sst);
         } else {
@@ -56,7 +60,7 @@ impl Run {
 
 #[derive(Debug, Clone)]
 struct Runs {
-    runs: Vec<Run>,
+    pub runs: Vec<Run>,
 }
 
 impl Runs {
@@ -65,11 +69,11 @@ impl Runs {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Version {
     id: u64,
     sst_files: Vec<Runs>,
-    seq_map: HashMap<u64, Arc<FileMetaData>>,
+    seq_map: HashMap<u64, Arc<FileStatistics>>,
 }
 
 pub type VersionRef = Arc<Version>;
@@ -88,17 +92,30 @@ impl Default for Version {
 }
 
 impl Version {
-    pub fn level_n(&self, n: usize) -> impl DoubleEndedIterator<Item = &FileMetaData> {
-        self.sst_files[n]
+    pub fn level_n(&self, n: u32) -> impl DoubleEndedIterator<Item = &FileStatistics> {
+        self.sst_files[n as usize]
             .runs
             .iter()
             .map(|r| r.files.iter().map(|f| f.as_ref()))
             .flatten()
     }
-    pub fn list_run<F: FnMut(&Run)>(&self, level: u64, mut f: F) {
+    pub fn list_run<F: FnMut(&Run)>(&self, level: u32, mut f: F) {
         for run in &self.sst_files[level as usize].runs {
             f(run)
         }
+    }
+
+    pub fn level_size(&self, level: u32) -> u32 {
+        self.level_n(level).count() as u32
+    }
+}
+
+impl Debug for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Version")
+            .field("id", &self.id)
+            .field("sst_files", &self.sst_files)
+            .finish()
     }
 }
 
@@ -108,7 +125,7 @@ pub struct VersionLogSerializer;
 impl LogEntrySerializer for VersionLogSerializer {
     type Entry = Version;
 
-    fn write<W>(&mut self, entry: &Self::Entry, mut w: W) -> u64
+    fn write<W>(&self, entry: &Self::Entry, mut w: W) -> u64
     where
         W: Write,
     {
@@ -125,13 +142,13 @@ impl LogEntrySerializer for VersionLogSerializer {
         let mut sum = 0;
         for file in total_iter {
             let mut s = FileMetaDataLogSerializer::default();
-            sum += s.write(file, &mut w);
+            sum += s.write(&file.meta, &mut w);
         }
 
         3 * 8 + 4 + sum
     }
 
-    fn read<R>(&mut self, mut r: R) -> Option<Self::Entry>
+    fn read<R>(&self, mut r: R) -> Option<Self::Entry>
     where
         R: Read,
     {
@@ -146,31 +163,30 @@ impl LogEntrySerializer for VersionLogSerializer {
 
         for _ in 0..total_files {
             let mut s = FileMetaDataLogSerializer::default();
-            let f = s.read(&mut r)?;
-            if f.level >= MAX_LEVEL {
-                panic!("level not match {}", f.level);
+            let meta = s.read(&mut r)?;
+            if meta.level >= MAX_LEVEL {
+                panic!("level not match {}", meta.level);
             }
-            if last_level != f.level {
+            if last_level != meta.level {
                 last_max = None;
-                last_level = f.level;
+                last_level = meta.level;
             }
-            let level = f.level as usize;
+            let level = meta.level as usize;
             let mut new_run = true;
             if let Some(last_max) = &last_max {
-                if f.min < last_max {
+                if meta.min < last_max {
                     new_run = false;
                 }
             }
             if new_run {
                 entry.sst_files[level].runs.push(Run::new());
             }
+            last_max = Some(meta.max.clone());
+            let seq = meta.seq;
+            let sst = Arc::new(FileStatistics::new(meta));
+            entry.seq_map.insert(seq, sst.clone());
 
-            last_max = Some(f.max.clone());
-            entry.sst_files[level]
-                .runs
-                .last_mut()
-                .unwrap()
-                .push(Arc::new(f));
+            entry.sst_files[level].runs.last_mut().unwrap().push(sst);
         }
         Some(entry)
     }
@@ -178,7 +194,7 @@ impl LogEntrySerializer for VersionLogSerializer {
 
 #[derive(Debug)]
 pub enum VersionEdit {
-    SSTAppended(Arc<FileMetaData>),
+    SSTAppended(FileMetaData),
     SSTRemove(u64),
     NewRun(u64),
     VersionChanged(u64),
@@ -228,13 +244,71 @@ impl FileMetaData {
     }
 }
 
+const FILE_STATE_USING: u8 = 0;
+const FILE_STATE_PICKED: u8 = 1;
+const FILE_STATE_DEPRECATED: u8 = 2;
+
+#[derive(Debug)]
+pub struct FileStatistics {
+    meta: FileMetaData,
+    state: AtomicU8,
+    bloom_fail_count: AtomicU32,
+}
+
+impl FileStatistics {
+    pub fn new(meta: FileMetaData) -> Self {
+        Self {
+            meta,
+            state: AtomicU8::new(FILE_STATE_USING),
+            bloom_fail_count: AtomicU32::new(0),
+        }
+    }
+    pub fn meta(&self) -> &FileMetaData {
+        &self.meta
+    }
+
+    pub fn set_using(&self) {
+        self.state.store(FILE_STATE_USING, Ordering::Relaxed);
+    }
+
+    pub fn is_using(&self) -> bool {
+        self.state.load(Ordering::Acquire) == FILE_STATE_USING
+    }
+
+    pub fn is_using_relaxed(&self) -> bool {
+        self.state.load(Ordering::Relaxed) == FILE_STATE_USING
+    }
+
+    pub fn set_picked(&self) -> bool {
+        self.state
+            .compare_exchange(
+                FILE_STATE_USING,
+                FILE_STATE_PICKED,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+
+    pub fn set_deprecated(&self) -> bool {
+        self.state
+            .compare_exchange(
+                FILE_STATE_PICKED,
+                FILE_STATE_DEPRECATED,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct FileMetaDataLogSerializer;
 
 impl LogEntrySerializer for FileMetaDataLogSerializer {
     type Entry = FileMetaData;
 
-    fn write<W>(&mut self, entry: &Self::Entry, mut w: W) -> u64
+    fn write<W>(&self, entry: &Self::Entry, mut w: W) -> u64
     where
         W: Write,
     {
@@ -250,7 +324,7 @@ impl LogEntrySerializer for FileMetaDataLogSerializer {
         32 + 4 + 8 + entry.min.len() as u64 + entry.max.len() as u64
     }
 
-    fn read<R>(&mut self, mut r: R) -> Option<Self::Entry>
+    fn read<R>(&self, mut r: R) -> Option<Self::Entry>
     where
         R: Read,
     {
@@ -292,7 +366,7 @@ pub struct ManifestLogSerializer;
 impl LogEntrySerializer for ManifestLogSerializer {
     type Entry = VersionEdit;
 
-    fn write<W>(&mut self, entry: &Self::Entry, mut w: W) -> u64
+    fn write<W>(&self, entry: &Self::Entry, mut w: W) -> u64
     where
         W: Write,
     {
@@ -335,7 +409,7 @@ impl LogEntrySerializer for ManifestLogSerializer {
         }
     }
 
-    fn read<R>(&mut self, mut r: R) -> Option<Self::Entry>
+    fn read<R>(&self, mut r: R) -> Option<Self::Entry>
     where
         R: Read,
     {
@@ -344,7 +418,7 @@ impl LogEntrySerializer for ManifestLogSerializer {
             1 => {
                 let mut s = FileMetaDataLogSerializer::default();
                 let meta = s.read(r)?;
-                Some(VersionEdit::SSTAppended(Arc::new(meta)))
+                Some(VersionEdit::SSTAppended(meta))
             }
             2 => Some(VersionEdit::SSTRemove(r.read_u64::<LE>().ok()?)),
             3 => Some(VersionEdit::VersionChanged(r.read_u64::<LE>().ok()?)),
@@ -379,33 +453,44 @@ pub struct VersionSet {
 impl VersionSet {
     pub fn add(&mut self, edit: &VersionEdit) -> Option<()> {
         match edit {
-            VersionEdit::SSTAppended(file) => {
-                let level = file.level as usize;
+            VersionEdit::SSTAppended(meta) => {
+                let level = meta.level as usize;
                 if self.version.sst_files[level].runs.is_empty() {
                     self.version.sst_files[level].runs.push(Run::new());
                 }
                 let cur = self.version.sst_files[level].runs.last_mut().unwrap();
-                cur.push(file.clone());
+                let fs = Arc::new(FileStatistics::new(meta.clone()));
 
-                self.version.seq_map.insert(file.seq, file.clone());
+                cur.push(fs.clone());
+
+                self.version.seq_map.insert(meta.seq, fs.clone());
                 Some(())
             }
             VersionEdit::SSTRemove(seq) => {
-                let file = self.version.seq_map.get(seq)?;
-                let level = file.level as usize;
+                let fs = self.version.seq_map.get(seq)?;
+                let level = fs.meta.level as usize;
                 let mut ok = false;
-                for run in &mut self.version.sst_files[level].runs {
-                    match run.files.binary_search_by(|f| f.seq.cmp(seq)) {
+                let mut drop_idx = None;
+                for (idx, run) in self.version.sst_files[level].runs.iter_mut().enumerate() {
+                    match run.files.binary_search_by(|f| f.meta.seq.cmp(seq)) {
                         Ok(index) => {
                             ok = true;
                             run.files.remove(index);
+                            self.version.seq_map.remove(seq);
+                            if run.files.is_empty() {
+                                drop_idx = Some(idx);
+                            }
                             break;
                         }
-                        Err(_) => (),
+                        Err(_) => {}
                     }
                 }
                 if !ok {
+                    error!("sst remove level {} seq {} fail", level, seq);
                     return None;
+                }
+                if let Some(idx) = drop_idx {
+                    self.version.sst_files[level].runs.remove(idx);
                 }
 
                 Some(())
@@ -660,24 +745,31 @@ impl Manifest {
         return_seq
     }
 
-    pub fn add_sst(&self, meta: Arc<FileMetaData>) {
-        let edit = VersionEdit::SSTAppended(meta);
-        self.commit(&edit);
-        self.version_set.lock().unwrap().add(&edit);
-    }
-
-    pub fn add_sst_with<F: FnOnce()>(&self, meta: Arc<FileMetaData>, f: F) {
+    pub fn add_sst_with<F: FnOnce(Arc<Version>)>(&self, meta: FileMetaData, new_run: bool, f: F) {
+        if new_run {
+            let edit = VersionEdit::NewRun(meta.level as u64);
+            self.commit(&edit);
+            let mut vs = self.version_set.lock().unwrap();
+            vs.add(&edit);
+        }
+        let seq = meta.seq;
         let edit = VersionEdit::SSTAppended(meta);
         self.commit(&edit);
         let mut vs = self.version_set.lock().unwrap();
         vs.add(&edit);
-        f();
+        info!("add sst {} {:?}", seq, vs.current());
+
+        f(vs.current());
     }
 
-    pub fn remove_sst(&self, seq: u64) {
-        let edit = VersionEdit::SSTRemove(seq);
-        self.commit(&edit);
-        self.version_set.lock().unwrap().add(&edit);
+    pub fn modify_with<F: FnOnce(Arc<Version>)>(&self, versions: Vec<VersionEdit>, f: F) {
+        let mut vs = self.version_set.lock().unwrap();
+        for v in versions {
+            self.wal.lock().unwrap().append(&v);
+            vs.add(&v);
+        }
+        self.wal.lock().unwrap().sync();
+        f(vs.current());
     }
 
     pub fn current(&self) -> VersionRef {

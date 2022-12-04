@@ -1,7 +1,10 @@
 use std::{
     collections::{HashSet, LinkedList},
     ops::RangeBounds,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
 
 use bytes::Bytes;
@@ -21,6 +24,7 @@ pub struct Imemtable {
 
     min_ver: u64,
     max_ver: u64,
+    flushed: AtomicBool,
 }
 
 impl Imemtable {
@@ -61,6 +65,7 @@ impl Imemtable {
             seq,
             min_ver,
             max_ver,
+            flushed: AtomicBool::new(false),
         }
     }
 }
@@ -83,8 +88,8 @@ impl Imemtable {
             None
         }
     }
-    pub fn entry_iter<'a>(&'a self) -> Box<dyn Iterator<Item = &KvEntry> + 'a> {
-        Box::new(self.keys.iter())
+    pub fn entry_iter<'a>(&'a self) -> Box<dyn Iterator<Item = KvEntry> + 'a> {
+        Box::new(self.keys.iter().cloned())
     }
 
     pub fn seq(&self) -> u64 {
@@ -97,6 +102,14 @@ impl Imemtable {
 
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
+    }
+
+    pub fn set_flush(&self) {
+        self.flushed.store(true, Ordering::Relaxed);
+    }
+
+    pub fn is_flushed(&self) -> bool {
+        self.flushed.load(Ordering::Relaxed)
     }
 }
 
@@ -158,28 +171,36 @@ impl Imemtable {
 
 #[derive(Debug, Clone)]
 pub struct Imemtables {
-    imemtables: LinkedList<Arc<Imemtable>>,
+    pub imemtables: Vec<Arc<Imemtable>>,
 }
 
 impl Imemtables {
     pub fn new() -> Self {
-        let vec = LinkedList::new();
+        let vec = Vec::new();
         Self { imemtables: vec }
     }
-    pub fn push(&mut self, table: Imemtable) -> Arc<Imemtable> {
-        let table = Arc::new(table);
-        self.imemtables.push_back(table.clone());
-        table
+
+    pub fn iter(&self) -> impl Iterator<Item = &Arc<Imemtable>> {
+        self.imemtables.iter()
     }
 
-    pub fn commit(&mut self, table: Arc<Imemtable>) {
-        assert!(
-            !self.imemtables.is_empty() && self.imemtables.front().unwrap().seq() == table.seq()
-        );
-        self.imemtables.pop_front();
-    }
     pub fn empty(&self) -> bool {
         self.imemtables.is_empty()
+    }
+
+    pub fn push(&self, imemtable: Arc<Imemtable>) -> Self {
+        let mut imemtables = self.imemtables.clone();
+        imemtables.push(imemtable);
+
+        Self { imemtables }
+    }
+
+    pub fn remove(&self, seq: u64) -> Self {
+        let mut imemtables = self.imemtables.clone();
+        if let Some(idx) = imemtables.iter().enumerate().find(|val| val.1.seq() == seq) {
+            imemtables.remove(idx.0);
+        }
+        Self { imemtables }
     }
 }
 

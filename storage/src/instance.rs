@@ -17,10 +17,8 @@ use crate::{
 #[allow(unused)]
 pub struct Instance {
     manifest: Arc<Manifest>,
-
     storage: Storage,
     conf: ConfigRef,
-    serializer: Arc<compaction::major::MajorSerializer>,
 }
 
 impl Instance {
@@ -31,12 +29,10 @@ impl Instance {
         fs::File::create(PathBuf::from(&conf.path).join("nanokv")).unwrap();
 
         let manifest = Arc::new(Manifest::new(conf.clone()));
-        let serializer = compaction::major::MajorSerializer::new(conf.clone(), manifest.clone());
         Self {
             storage: Storage::new(conf, manifest.clone()),
             manifest,
             conf,
-            serializer,
         }
     }
 

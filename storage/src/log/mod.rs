@@ -31,10 +31,10 @@ bitflags! {
 
 pub trait LogEntrySerializer {
     type Entry;
-    fn write<W>(&mut self, entry: &Self::Entry, w: W) -> u64
+    fn write<W>(&self, entry: &Self::Entry, w: W) -> u64
     where
         W: Write;
-    fn read<R>(&mut self, r: R) -> Option<Self::Entry>
+    fn read<R>(&self, r: R) -> Option<Self::Entry>
     where
         R: Read;
 }
@@ -44,7 +44,7 @@ pub trait LogEntrySerializer {
 impl LogEntrySerializer for String {
     type Entry = String;
 
-    fn write<W>(&mut self, entry: &Self::Entry, mut w: W) -> u64
+    fn write<W>(&self, entry: &Self::Entry, mut w: W) -> u64
     where
         W: Write,
     {
@@ -53,7 +53,7 @@ impl LogEntrySerializer for String {
         4 + entry.len() as u64
     }
 
-    fn read<R>(&mut self, mut r: R) -> Option<Self::Entry>
+    fn read<R>(&self, mut r: R) -> Option<Self::Entry>
     where
         R: Read,
     {

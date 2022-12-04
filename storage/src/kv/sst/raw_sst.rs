@@ -1,7 +1,7 @@
 use byteorder::{ByteOrder, WriteBytesExt};
 use bytes::{Buf, Bytes};
 use integer_encoding::{VarIntReader, VarIntWriter};
-use log::info;
+use log::{debug, info};
 
 use crate::iterator::{EqualFilter, ScanIter};
 use crate::kv::superversion::Lifetime;
@@ -241,6 +241,23 @@ impl SSTReader for RawSSTReader {
             ScanIter::new(EqualFilter::new(iter).map(kv_entry_to_value))
         }
     }
+
+    fn raw_scan<'a>(&self, lifetime: &Lifetime<'a>) -> ScanIter<'a, KvEntry> {
+        let beg = 0;
+        let end = self.inner.meta.total_keys;
+        let reader = unsafe {
+            core::mem::transmute::<_, &'static RawSSTReaderInner>(self.inner.clone().as_ref())
+        };
+
+        let iter = RawSSTIter {
+            reader,
+            beg,
+            end,
+            idx: beg,
+        };
+
+        ScanIter::new(EqualFilter::new(iter))
+    }
 }
 
 // raw sst entry
@@ -414,9 +431,9 @@ impl RawSSTWriter {
 impl RawSSTWriter {}
 
 impl SSTWriter for RawSSTWriter {
-    fn write<'a, I>(&'a mut self, level: u32, seq: u64, iter: I) -> FileMetaData
+    fn write<I>(&mut self, level: u32, seq: u64, iter: I) -> FileMetaData
     where
-        I: Iterator<Item = &'a KvEntry>,
+        I: Iterator<Item = KvEntry>,
     {
         let mut w = BufWriter::new(&mut self.file);
 
@@ -437,7 +454,7 @@ impl SSTWriter for RawSSTWriter {
             min_ver = min_ver.min(entry.version());
             max_ver = max_ver.max(entry.version());
 
-            let bytes = RawSSTEntry::write(entry, &mut w);
+            let bytes = RawSSTEntry::write(&entry, &mut w);
             last_entry = Some(entry);
 
             keys_offset.push(cur);
@@ -471,7 +488,7 @@ impl SSTWriter for RawSSTWriter {
         meta_info.write(&mut w).unwrap();
         w.flush().unwrap();
 
-        info!("write raw sst meta info {:?}", meta_info);
+        debug!("write raw sst meta info {:?}", meta_info);
 
         FileMetaData::new(seq, min_key, max_key, min_ver, max_ver, keys, level)
     }

@@ -1,5 +1,7 @@
 use std::io;
+use std::sync::Arc;
 
+use crate::iterator::KvIteratorItem;
 use crate::{iterator::EqualKey, log::LogEntrySerializer, value::Value, GetOption, WriteOption};
 use bitflags::bitflags;
 use byteorder::{ReadBytesExt, WriteBytesExt, LE};
@@ -159,6 +161,26 @@ impl EqualKey for &KvEntry {
     }
 }
 
+impl KvIteratorItem for KvEntry {
+    fn key(&self) -> &Bytes {
+        &self.key
+    }
+
+    fn version(&self) -> u64 {
+        self.ver
+    }
+}
+
+impl KvIteratorItem for &KvEntry {
+    fn key(&self) -> &Bytes {
+        &self.key
+    }
+
+    fn version(&self) -> u64 {
+        self.ver
+    }
+}
+
 pub fn kv_entry_to_value(entry: KvEntry) -> (Bytes, Value) {
     (entry.key(), Value::from_entry(&entry))
 }
@@ -172,7 +194,7 @@ pub struct KvEntryLogSerializer;
 impl LogEntrySerializer for KvEntryLogSerializer {
     type Entry = KvEntry;
 
-    fn write<W>(&mut self, entry: &Self::Entry, mut w: W) -> u64
+    fn write<W>(&self, entry: &Self::Entry, mut w: W) -> u64
     where
         W: io::Write,
     {
@@ -187,7 +209,7 @@ impl LogEntrySerializer for KvEntryLogSerializer {
         8 + 8 + entry.key.len() as u64 + entry.value.len() as u64
     }
 
-    fn read<R>(&mut self, mut r: R) -> Option<Self::Entry>
+    fn read<R>(&self, mut r: R) -> Option<Self::Entry>
     where
         R: io::Read,
     {
@@ -252,5 +274,11 @@ pub mod manifest;
 pub mod memtable;
 pub mod sst;
 pub use imemtable::Imemtable;
+pub use imemtable::Imemtables;
 pub use memtable::Memtable;
 pub mod superversion;
+
+pub struct ColumnFamilyTables {
+    pub memtable: Arc<Memtable>,
+    pub imemtables: Imemtables,
+}

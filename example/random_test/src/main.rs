@@ -90,9 +90,13 @@ fn main() {
                     let del_key = exist_keys.iter().next().unwrap().clone();
 
                     // make sure del_key exist
-                    ins.mut_storage()
+                    if ins
+                        .mut_storage()
                         .get(&GetOption::default(), del_key.clone())
-                        .unwrap();
+                        .is_none()
+                    {
+                        panic!("not found key {}", del_key);
+                    }
 
                     ins.mut_storage()
                         .del(&WriteOption::default(), del_key.clone())

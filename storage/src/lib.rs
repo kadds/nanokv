@@ -11,10 +11,10 @@ pub mod storage;
 pub mod util;
 
 pub mod value;
-pub type Config = config::Config;
-pub type ConfigRef = config::ConfigRef;
-pub type Storage = storage::Storage;
-pub type Instance = instance::Instance;
+pub use config::Config;
+pub use config::ConfigRef;
+pub use instance::Instance;
+pub use storage::Storage;
 
 pub use iterator::KvIterator;
 pub use option::GetOption;

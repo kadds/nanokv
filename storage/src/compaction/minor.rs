@@ -1,11 +1,11 @@
 use std::{
-    cell::UnsafeCell,
-    sync::{mpsc, Arc},
-    thread::{self, JoinHandle},
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
 use log::info;
+use threadpool::ThreadPool;
 
 use crate::{
     kv::{
@@ -20,76 +20,71 @@ use crate::{
 use super::CompactSerializer;
 
 pub struct MinorSerializer {
-    thread: UnsafeCell<Option<JoinHandle<()>>>,
-    rx: mpsc::Receiver<Option<Arc<Imemtable>>>,
-    tx: mpsc::Sender<Option<Arc<Imemtable>>>,
-    commit_tx: mpsc::SyncSender<(Arc<Imemtable>, Arc<FileMetaData>)>,
+    pool: ThreadPool,
 
     #[allow(unused)]
     manifest: Arc<Manifest>,
+    config: ConfigRef,
+
+    f: Arc<dyn Fn(FileMetaData) + Sync + Send + 'static>,
+}
+
+fn minor_compaction(
+    config: ConfigRef,
+    table: Arc<Imemtable>,
+    f: Arc<dyn Fn(FileMetaData) + Sync + Send + 'static>,
+) {
+    info!("do minor compaction {}", table.seq());
+    let meta = {
+        let beg = Instant::now();
+        let seq = table.seq();
+        let iter = table.entry_iter();
+        let mut sst = sst::raw_sst::RawSSTWriter::new(fname::sst_name(config, table.seq()));
+
+        let meta = sst.write(0, seq, iter);
+
+        let end = Instant::now();
+        info!("sst {} done, cost {}ms", seq, (end - beg).as_millis());
+        meta
+    };
+    f(meta);
 }
 
 impl MinorSerializer {
-    pub fn new(
-        conf: ConfigRef,
+    pub fn new<F: Fn(FileMetaData) + Send + Sync + 'static>(
+        config: ConfigRef,
         manifest: Arc<Manifest>,
-        commit_tx: mpsc::SyncSender<(Arc<Imemtable>, Arc<FileMetaData>)>,
+        f: F,
     ) -> Arc<Self> {
-        let (tx, rx) = mpsc::channel();
-        let this = Arc::new(Self {
-            thread: UnsafeCell::new(None),
-            rx,
-            tx,
-            commit_tx,
+        Arc::new(Self {
+            pool: threadpool::Builder::new()
+                .num_threads(config.minor_compaction_threads as usize)
+                .thread_name("minor compaction ".into())
+                .build(),
             manifest,
-        });
-        let that = this.clone();
-        unsafe {
-            let mut_thread = &mut *this.thread.get();
-            *mut_thread = Some(thread::spawn(move || {
-                that.main(conf);
-            }));
-        }
-        this
+            config,
+            f: Arc::new(f),
+        })
     }
 
-    fn main(&self, conf: ConfigRef) {
-        loop {
-            let table = match self.rx.recv().unwrap() {
-                Some(table) => table,
-                None => break,
-            };
-            let meta = {
-                let beg = Instant::now();
-                let seq = table.seq();
-                let iter = table.entry_iter();
-                let mut sst = sst::raw_sst::RawSSTWriter::new(fname::sst_name(conf, table.seq()));
-
-                let meta = sst.write(0, seq, iter);
-
-                let end = Instant::now();
-                info!("sst {} done, cost {}ms", seq, (end - beg).as_millis());
-                meta
-            };
-            self.commit_tx.send((table, Arc::new(meta))).unwrap();
-        }
-    }
-
-    pub fn compact_async(&self, table: Arc<Imemtable>) {
-        self.tx.send(Some(table)).unwrap();
+    pub fn compact_async(self: &Arc<Self>, table: Arc<Imemtable>) {
+        let this = self.clone();
+        let config = this.config;
+        let f = this.f.clone();
+        this.clone()
+            .pool
+            .execute(|| minor_compaction(config, table, f));
     }
 }
 
 impl Drop for MinorSerializer {
     fn drop(&mut self) {
-        let _ = self.tx.send(None);
+        self.pool.join();
     }
 }
 
 impl CompactSerializer for MinorSerializer {
     fn stop(&self) {
-        self.tx.send(None).unwrap();
+        self.pool.join();
     }
 }
-
-unsafe impl Sync for MinorSerializer {}

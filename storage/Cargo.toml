@@ -22,4 +22,6 @@ superslice = "1.0"
 lru = "0.8"
 integer-encoding = "3.0"
 governor = "0.5"
-
+threadpool = "1"
+crossbeam = "0.8"
+arc-swap = "1.5"
