@@ -1,8 +1,4 @@
-use std::{
-    fs,
-    ops::{Bound, RangeBounds},
-    path::PathBuf,
-};
+use std::ops::{Bound, RangeBounds};
 
 use crate::{
     cache::Cache,
@@ -112,7 +108,7 @@ impl<'a> SnapshotTable<'a> {
                     opt,
                     range.start_bound().cloned(),
                     range.end_bound().cloned(),
-                    &lifetime,
+                    lifetime,
                 ));
             }
         }

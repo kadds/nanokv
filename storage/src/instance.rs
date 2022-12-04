@@ -1,18 +1,12 @@
 use std::{
     fs,
     path::{Component, PathBuf},
-    sync::{atomic::AtomicU64, Arc},
+    sync::Arc,
 };
 
 use log::info;
 
-use crate::{
-    compaction,
-    config::ConfigRef,
-    kv::{manifest::Manifest, superversion::SuperVersion},
-    storage::Storage,
-    util::fname,
-};
+use crate::{config::ConfigRef, kv::manifest::Manifest, storage::Storage, util::fname};
 
 #[allow(unused)]
 pub struct Instance {
@@ -28,7 +22,7 @@ impl Instance {
         fname::make_sure(conf);
         fs::File::create(PathBuf::from(&conf.path).join("nanokv")).unwrap();
 
-        let manifest = Arc::new(Manifest::new(conf.clone()));
+        let manifest = Arc::new(Manifest::new(conf));
         Self {
             storage: Storage::new(conf, manifest.clone()),
             manifest,
@@ -63,5 +57,5 @@ impl Instance {
 
     pub fn compact_range(&self) {}
 
-    pub fn compact_config(&self, io_limit: f32) {}
+    pub fn compact_config(&self, _io_limit: f32) {}
 }

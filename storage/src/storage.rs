@@ -1,9 +1,8 @@
 use std::{
-    mem::swap,
     ops::RangeBounds,
     sync::{
-        atomic::{AtomicPtr, AtomicU64, Ordering},
-        mpsc, Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -17,11 +16,8 @@ use crate::{
     compaction::{major::MajorSerializer, minor::MinorSerializer},
     iterator::{MergedIter, ScanIter},
     kv::{
-        imemtable::Imemtables,
-        manifest::{FileMetaData, VersionEdit},
-        sst::SnapshotTable,
-        superversion::SuperVersion,
-        ColumnFamilyTables,
+        imemtable::Imemtables, manifest::VersionEdit, sst::SnapshotTable,
+        superversion::SuperVersion, ColumnFamilyTables,
     },
     log::{wal::INVALID_SEQ, LogReplayer},
     snapshot::Snapshot,
@@ -68,7 +64,7 @@ impl StorageInner {
         };
         let tables = ArcSwap::new(Arc::new(ColumnFamilyTables {
             memtable: Arc::new(Memtable::new(seq)),
-            imemtables: Imemtables::new(),
+            imemtables: Imemtables::default(),
         }));
         let super_version = ArcSwap::new(Arc::new(SuperVersion {
             cf_tables: tables.load().clone(),
@@ -102,7 +98,7 @@ impl StorageInner {
         let _lock = self.lock.lock().unwrap();
         let sv = self.super_version.load();
         let val = self.step_version.fetch_add(1, Ordering::SeqCst);
-        let sv = f(&*sv.as_ref());
+        let sv = f(sv.as_ref());
         assert!(val + 1 == sv.step_version);
 
         self.tables.store(sv.cf_tables.clone());
@@ -131,28 +127,22 @@ impl Storage {
             (seq, false)
         };
 
-        let inner = Arc::new(StorageInner::new(
-            seq,
-            config,
-            manifest.clone(),
-            need_restore,
-        ));
+        let inner = Arc::new(StorageInner::new(seq, config, manifest, need_restore));
 
         let inner2 = inner.clone();
-        let serializer =
-            MinorSerializer::new(config.clone(), inner.manifest.clone(), move |meta| {
-                let seq = meta.seq;
-                inner2.manifest.add_sst_with(meta, true, |current| {
-                    inner2.modify_super_version(move |sv| SuperVersion {
-                        cf_tables: Arc::new(ColumnFamilyTables {
-                            memtable: sv.cf_tables.memtable.clone(),
-                            imemtables: sv.cf_tables.imemtables.remove(seq),
-                        }),
-                        sst_version: current,
-                        step_version: sv.step_version + 1,
-                    });
+        let serializer = MinorSerializer::new(config, inner.manifest.clone(), move |meta| {
+            let seq = meta.seq;
+            inner2.manifest.add_sst_with(meta, true, |current| {
+                inner2.modify_super_version(move |sv| SuperVersion {
+                    cf_tables: Arc::new(ColumnFamilyTables {
+                        memtable: sv.cf_tables.memtable.clone(),
+                        imemtables: sv.cf_tables.imemtables.remove(seq),
+                    }),
+                    sst_version: current,
+                    step_version: sv.step_version + 1,
                 });
             });
+        });
 
         let inner2 = inner.clone();
         let major_serializer = MajorSerializer::new(
@@ -403,9 +393,9 @@ impl Storage {
             let target = imemtable.clone();
             let cf_tables = Arc::new(ColumnFamilyTables {
                 memtable: Arc::new(Memtable::new(new_seq)),
-                imemtables: tables.imemtables.push(imemtable.clone()),
+                imemtables: tables.imemtables.push(imemtable),
             });
-            let t = cf_tables.clone();
+            let t = cf_tables;
 
             inner.modify_super_version(move |sv| SuperVersion {
                 cf_tables: t,

@@ -1,9 +1,6 @@
-use std::{
-    collections::HashSet,
-    sync::{
-        atomic::{AtomicU32, AtomicU64, Ordering},
-        Arc, Mutex,
-    },
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    Arc,
 };
 
 use log::info;
@@ -13,22 +10,15 @@ use threadpool::ThreadPool;
 use crate::{
     iterator::{MergedIter, ScanIter},
     kv::{
-        manifest::{FileMetaData, Manifest, Version, VersionEdit, VersionRef, MAX_LEVEL},
+        manifest::{FileMetaData, Manifest, Version, MAX_LEVEL},
         sst::{self, SSTReader, SSTWriter},
         superversion::{Lifetime, SuperVersion},
     },
-    util::fname::{self, sst_name},
+    util::fname::{self},
     ConfigRef,
 };
 
 use super::CompactSerializer;
-
-pub struct MajorCompactTask {
-    level_bottom: u32,
-    level_top: u32,
-    bottom_seqs: Vec<u64>,
-    top_seqs: Vec<u64>,
-}
 
 pub type CompactSSTFiles = Vec<FileMetaData>;
 
@@ -84,7 +74,7 @@ fn major_compaction(
 
     let iter = ScanIter::new(MergedIter::new(iters));
 
-    let meta = writer.write(info.level_top, new_seq, iter.map(|v| v));
+    let meta = writer.write(info.level_top, new_seq, iter);
 
     info!("major compaction {} done", new_seq);
     additional.push(meta);
@@ -98,7 +88,7 @@ impl MajorSerializer {
         manifest: Arc<Manifest>,
         f: F,
     ) -> Arc<Self> {
-        let this = Arc::new(Self {
+        Arc::new(Self {
             pool: threadpool::Builder::new()
                 .num_threads(config.major_compaction_threads as usize)
                 .thread_name("major compaction ".into())
@@ -107,8 +97,7 @@ impl MajorSerializer {
             config,
             f: Arc::new(f),
             factor: AtomicU32::new(10),
-        });
-        this
+        })
     }
 
     fn compact_async(&self, info: CompactInfo) {
@@ -144,7 +133,7 @@ impl CompactSerializer for MajorSerializer {
     }
 }
 
-fn pick_compaction_info(config: ConfigRef, version: &Version) -> Option<CompactInfo> {
+fn pick_compaction_info(_config: ConfigRef, version: &Version) -> Option<CompactInfo> {
     // check level 0
     let mut info = CompactInfo::default();
     let mut cancel = false;

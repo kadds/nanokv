@@ -15,7 +15,7 @@ use crate::{util::crc::crc_mask, ConfigRef};
 use super::{LogEntrySerializer, LogSegmentFlags, SEGMENT_CONTENT_SIZE};
 
 const DEFAULT_ALLOC_SIZE: u64 = 1024 * 1024 * 5; // 5MB
-const DETAIL_ALLOC_SIZE: u64 = 1024 * 1024 * 5; // 5MB
+const DELTA_ALLOC_SIZE: u64 = 1024 * 1024 * 5; // 5MB
 
 pub const INVALID_SEQ: u64 = u64::MAX;
 
@@ -23,6 +23,7 @@ struct LogInner {
     current: Option<File>,
     seq: u64,
     write_bytes: u64,
+    file_length: u64,
 }
 
 pub struct LogWriter<E, S> {
@@ -50,7 +51,7 @@ where
             None
         } else {
             let current = File::create(name_fn(config, seq)).unwrap();
-            current.set_len(DEFAULT_ALLOC_SIZE);
+            current.set_len(DEFAULT_ALLOC_SIZE).unwrap();
             Some(current)
         };
 
@@ -59,6 +60,7 @@ where
                 current,
                 seq,
                 write_bytes: 0,
+                file_length: DEFAULT_ALLOC_SIZE,
             }),
             config,
             name_fn,
@@ -75,6 +77,8 @@ where
     pub fn append(&self, entry: &E) {
         let mut inner = self.inner.lock().unwrap();
         let bytes;
+        let total_bytes = inner.write_bytes;
+        let mut length = inner.file_length;
         {
             if inner.current.is_none() {
                 return;
@@ -83,6 +87,10 @@ where
             let mut w = Vec::with_capacity(SEGMENT_CONTENT_SIZE).writer();
 
             bytes = self.serializer.write(entry, &mut w);
+            if total_bytes + bytes > length {
+                length += DELTA_ALLOC_SIZE;
+                inner.current.as_ref().unwrap().set_len(length).unwrap();
+            }
 
             let mut do_write_segment = |item: &[u8], flags| {
                 let mut crc_builder = crc32fast::Hasher::new();
@@ -120,28 +128,38 @@ where
 
             file_writer.flush().unwrap();
         }
-        inner.write_bytes = bytes;
+        inner.write_bytes = bytes + total_bytes;
+        inner.file_length = length;
     }
 
     pub fn sync(&self) {
         let mut inner = self.inner.lock().unwrap();
-        inner.current.as_mut().map(|f| f.sync_data().unwrap());
+        if let Some(f) = inner.current.as_mut() {
+            f.sync_data().unwrap()
+        }
     }
 
     pub fn rotate(&self, seq: u64) {
         let mut inner = self.inner.lock().unwrap();
-        inner.current.as_mut().map(|f| f.sync_data().unwrap());
+        if let Some(f) = inner.current.as_mut() {
+            f.sync_data().unwrap()
+        }
 
         inner.seq = seq;
         inner.current = Some(File::create((self.name_fn)(self.config, seq)).unwrap());
-        inner.current.as_mut().unwrap().set_len(DEFAULT_ALLOC_SIZE);
+        inner
+            .current
+            .as_mut()
+            .unwrap()
+            .set_len(DEFAULT_ALLOC_SIZE)
+            .unwrap();
 
         info!("wal rotate to {}", seq);
     }
 
     pub fn remove(&self, seq: u64) {
         let name = (self.name_fn)(self.config, seq);
-        fs::remove_file(name);
+        let _ = fs::remove_file(name); // can be ignored
     }
 
     pub fn seq(&self) -> u64 {

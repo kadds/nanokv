@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, LinkedList},
+    collections::HashSet,
     ops::RangeBounds,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -72,7 +72,7 @@ impl Imemtable {
 
 impl Imemtable {
     pub fn min_max(&self) -> Option<(Bytes, Bytes)> {
-        if self.keys.len() > 0 {
+        if !self.keys.is_empty() {
             Some((
                 self.keys.first().unwrap().key(),
                 self.keys.last().unwrap().key(),
@@ -82,7 +82,7 @@ impl Imemtable {
         }
     }
     pub fn min_max_ver(&self) -> Option<(u64, u64)> {
-        if self.keys.len() > 0 {
+        if !self.keys.is_empty() {
             Some((self.min_ver, self.max_ver))
         } else {
             None
@@ -114,7 +114,7 @@ impl Imemtable {
 }
 
 impl Imemtable {
-    pub fn get<'a>(&self, opt: &GetOption, key: Bytes, lifetime: &Lifetime<'a>) -> Option<Value> {
+    pub fn get<'a>(&self, opt: &GetOption, key: Bytes, _lifetime: &Lifetime<'a>) -> Option<Value> {
         let mut range = self.keys.equal_range_by(|entry| entry.key().cmp(&key));
 
         if range.is_empty() {
@@ -169,17 +169,12 @@ impl Imemtable {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Imemtables {
     pub imemtables: Vec<Arc<Imemtable>>,
 }
 
 impl Imemtables {
-    pub fn new() -> Self {
-        let vec = Vec::new();
-        Self { imemtables: vec }
-    }
-
     pub fn iter(&self) -> impl Iterator<Item = &Arc<Imemtable>> {
         self.imemtables.iter()
     }

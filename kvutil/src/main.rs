@@ -1,11 +1,11 @@
-use std::{fmt::Write, fs::File, io::Read, path::PathBuf};
+use std::{fs::File, io::Read, path::PathBuf};
 
 use bytes::Bytes;
 use clap::Parser;
 use opt::ManifestCommands;
 use storage::{
     kv::{
-        manifest::{ManifestLogSerializer, Version, VersionSet},
+        manifest::{ManifestLogSerializer, VersionSet},
         sst::SSTReader,
         superversion::Lifetime,
     },

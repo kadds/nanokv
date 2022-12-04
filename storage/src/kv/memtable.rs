@@ -1,11 +1,10 @@
 use std::ops::{Bound, RangeBounds};
 
 use std::sync::atomic::AtomicU64;
-use std::sync::Arc;
 
 use bytes::Bytes;
 
-use super::superversion::{Lifetime, SuperVersion};
+use super::superversion::Lifetime;
 use super::{GetOption, KvEntry, SetResult, WriteOption};
 use crate::iterator::{EqualFilter, ScanIter};
 use crate::kv::kv_entry_ref_to_value;
@@ -53,7 +52,7 @@ impl Memtable {
 }
 
 impl Memtable {
-    pub fn get<'a>(&self, opt: &GetOption, key: Bytes, lifetime: &Lifetime<'a>) -> Option<Value> {
+    pub fn get<'a>(&self, opt: &GetOption, key: Bytes, _lifetime: &Lifetime<'a>) -> Option<Value> {
         use std::ops::Bound::Included;
         let mut iter = self.list.range(
             Included(&KvEntry::from_search(key.to_owned(), u64::MAX)),
@@ -78,7 +77,7 @@ impl Memtable {
         &self,
         opt: &GetOption,
         range: R,
-        lifetime: &Lifetime<'a>, // lifetime parameter
+        _lifetime: &Lifetime<'a>, // lifetime parameter
     ) -> ScanIter<'a, (Bytes, Value)> {
         use std::ops::Bound::*;
         let beg = match range.start_bound() {

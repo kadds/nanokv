@@ -1,8 +1,6 @@
-use std::{collections::LinkedList, marker::PhantomData, sync::Arc};
+use std::{marker::PhantomData, sync::Arc};
 
-use arc_swap::ArcSwap;
-
-use super::{imemtable::Imemtables, manifest::Version, ColumnFamilyTables, Imemtable, Memtable};
+use super::{manifest::Version, ColumnFamilyTables};
 
 pub struct SuperVersion {
     pub cf_tables: Arc<ColumnFamilyTables>,

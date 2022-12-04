@@ -23,7 +23,7 @@ impl Cache {
 }
 
 impl Cache {
-    pub fn get_opened_sst(&self, level: u32, seq: u64) -> Arc<dyn SSTReader> {
+    pub fn get_opened_sst(&self, _level: u32, seq: u64) -> Arc<dyn SSTReader> {
         let sst_path = fname::sst_name(self.config, seq);
 
         self.opened_sst

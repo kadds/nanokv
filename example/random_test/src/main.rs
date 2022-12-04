@@ -62,7 +62,7 @@ where
             "{} {:.2}ns/op, tps {:.1}/s",
             self.name,
             cost.as_nanos() as f64 / self.ops as f64,
-            self.ops as f64 / (cost.as_nanos() as f64 / 1000_000_000f64)
+            self.ops as f64 / (cost.as_nanos() as f64 / 1_000_000_000_f64)
         );
         r
     }
@@ -85,7 +85,7 @@ fn main() {
 
     let mut case = TestCase::new(
         || {
-            for i in 0..total_test {
+            for _i in 0..total_test {
                 if is_deleted() && !exist_keys.is_empty() {
                     let del_key = exist_keys.iter().next().unwrap().clone();
 
@@ -144,7 +144,7 @@ fn main() {
                 {
                     let _ = ins.mut_storage().get(&GetOption::with_debug(), key.clone());
 
-                    assert!(false, "{} should be existed", key.clone(),)
+                    panic!("{} should be existed", key.clone())
                 }
             }
         },
@@ -167,12 +167,7 @@ fn main() {
                         .get(&GetOption::with_debug(), key.clone())
                         .unwrap();
 
-                    assert!(
-                        false,
-                        "{} ver {} should be deleted",
-                        key.clone(),
-                        value.version()
-                    )
+                    panic!("{} ver {} should be deleted", key.clone(), value.version())
                 }
             }
         },

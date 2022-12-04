@@ -1,4 +1,4 @@
-use std::{collections::BinaryHeap, marker::PhantomData, sync::Arc};
+use std::{collections::BinaryHeap, marker::PhantomData};
 
 use bytes::Bytes;
 

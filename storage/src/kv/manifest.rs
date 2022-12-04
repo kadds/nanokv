@@ -32,19 +32,19 @@ pub struct Run {
 impl Run {
     pub fn new() -> Self {
         Self {
-            files: Vec::new(),
+            files: Vec::with_capacity(6),
             min: Bytes::new(),
             max: Bytes::new(),
         }
     }
 
     pub fn push(&mut self, sst: Arc<FileStatistics>) {
-        if self.min.len() == 0 {
+        if self.min.is_empty() {
             self.min = sst.meta.min.clone();
         } else {
             self.min = self.min.clone().min(sst.meta.min.clone());
         }
-        if self.max.len() == 0 {
+        if self.max.is_empty() {
             self.max = sst.meta.max.clone();
         } else {
             self.max = self.max.clone().max(sst.meta.max.clone());
@@ -96,8 +96,7 @@ impl Version {
         self.sst_files[n as usize]
             .runs
             .iter()
-            .map(|r| r.files.iter().map(|f| f.as_ref()))
-            .flatten()
+            .flat_map(|r| r.files.iter().map(|f| f.as_ref()))
     }
     pub fn list_run<F: FnMut(&Run)>(&self, level: u32, mut f: F) {
         for run in &self.sst_files[level as usize].runs {
@@ -132,16 +131,14 @@ impl LogEntrySerializer for VersionLogSerializer {
         let total_iter = entry
             .sst_files
             .iter()
-            .map(|r| r.runs.iter())
-            .flatten()
-            .map(|v| v.files.iter())
-            .flatten();
+            .flat_map(|r| r.runs.iter())
+            .flat_map(|v| v.files.iter());
         let total_files = total_iter.clone().count();
         w.write_u32::<LE>(total_files as u32).unwrap();
 
         let mut sum = 0;
         for file in total_iter {
-            let mut s = FileMetaDataLogSerializer::default();
+            let s = FileMetaDataLogSerializer::default();
             sum += s.write(&file.meta, &mut w);
         }
 
@@ -162,7 +159,7 @@ impl LogEntrySerializer for VersionLogSerializer {
         let mut last_level = MAX_LEVEL + 1;
 
         for _ in 0..total_files {
-            let mut s = FileMetaDataLogSerializer::default();
+            let s = FileMetaDataLogSerializer::default();
             let meta = s.read(&mut r)?;
             if meta.level >= MAX_LEVEL {
                 panic!("level not match {}", meta.level);
@@ -373,7 +370,7 @@ impl LogEntrySerializer for ManifestLogSerializer {
         match &entry {
             VersionEdit::SSTAppended(meta) => {
                 w.write_u8(1).unwrap();
-                let mut s = FileMetaDataLogSerializer::default();
+                let s = FileMetaDataLogSerializer::default();
                 s.write(meta, w) + 1
             }
             VersionEdit::SSTRemove(seq) => {
@@ -398,7 +395,7 @@ impl LogEntrySerializer for ManifestLogSerializer {
             }
             VersionEdit::Snapshot(ver) => {
                 w.write_u8(6).unwrap();
-                let mut s = VersionLogSerializer::default();
+                let s = VersionLogSerializer::default();
                 s.write(ver, w) + 1
             }
             VersionEdit::NewRun(level) => {
@@ -416,7 +413,7 @@ impl LogEntrySerializer for ManifestLogSerializer {
         let ty = r.read_u8().unwrap();
         match ty {
             1 => {
-                let mut s = FileMetaDataLogSerializer::default();
+                let s = FileMetaDataLogSerializer::default();
                 let meta = s.read(r)?;
                 Some(VersionEdit::SSTAppended(meta))
             }
@@ -427,7 +424,7 @@ impl LogEntrySerializer for ManifestLogSerializer {
                 r.read_u64::<LE>().ok()?,
             )),
             6 => {
-                let mut s = VersionLogSerializer::default();
+                let s = VersionLogSerializer::default();
                 Some(VersionEdit::Snapshot(Arc::new(s.read(&mut r)?)))
             }
             7 => {
@@ -463,7 +460,7 @@ impl VersionSet {
 
                 cur.push(fs.clone());
 
-                self.version.seq_map.insert(meta.seq, fs.clone());
+                self.version.seq_map.insert(meta.seq, fs);
                 Some(())
             }
             VersionEdit::SSTRemove(seq) => {
@@ -472,17 +469,14 @@ impl VersionSet {
                 let mut ok = false;
                 let mut drop_idx = None;
                 for (idx, run) in self.version.sst_files[level].runs.iter_mut().enumerate() {
-                    match run.files.binary_search_by(|f| f.meta.seq.cmp(seq)) {
-                        Ok(index) => {
-                            ok = true;
-                            run.files.remove(index);
-                            self.version.seq_map.remove(seq);
-                            if run.files.is_empty() {
-                                drop_idx = Some(idx);
-                            }
-                            break;
+                    if let Ok(index) = run.files.binary_search_by(|f| f.meta.seq.cmp(seq)) {
+                        ok = true;
+                        run.files.remove(index);
+                        self.version.seq_map.remove(seq);
+                        if run.files.is_empty() {
+                            drop_idx = Some(idx);
                         }
-                        Err(_) => {}
+                        break;
                     }
                 }
                 if !ok {
@@ -566,18 +560,15 @@ fn clear_log(config: ConfigRef, seq: u64) {
     for file in parent.read_dir().unwrap() {
         match file {
             Ok(file) => {
-                match file
+                if let Some(v) = file
                     .path()
                     .file_stem()
                     .and_then(|n| n.to_str())
                     .and_then(|v| v.parse::<u64>().ok())
                 {
-                    Some(v) => {
-                        if v != seq {
-                            let _ = fs::remove_file(file.path());
-                        }
+                    if v != seq {
+                        let _ = fs::remove_file(file.path());
                     }
-                    None => (),
                 }
             }
             Err(err) => {
@@ -633,11 +624,8 @@ impl Manifest {
 
     pub fn load_current_log_sequence(path: &PathBuf) -> Option<u64> {
         let mut buf = String::new();
-        match File::open(&path).map(|mut f| f.read_to_string(&mut buf)) {
-            Err(e) => {
-                warn!("{:?} read {}", path.as_os_str(), e);
-            }
-            Ok(_) => (),
+        if let Err(e) = File::open(path).map(|mut f| f.read_to_string(&mut buf)) {
+            warn!("{:?} read {}", path.as_os_str(), e);
         }
         buf.parse().ok()
     }
@@ -677,7 +665,7 @@ impl Manifest {
 
     fn rotate(&self) {
         let old_seq = {
-            let mut wal = self.wal.lock().unwrap();
+            let wal = self.wal.lock().unwrap();
             let old_seq = wal.seq();
             let seq = self.allocate_manifest_sequence();
 
@@ -777,7 +765,7 @@ impl Manifest {
         ver.current()
     }
 
-    pub fn new_snapshot<'a>(&'a self) -> SnapshotGuard<'a> {
+    pub fn new_snapshot(&self) -> SnapshotGuard<'_> {
         let mut ver = self.version_set.lock().unwrap();
         SnapshotGuard {
             snapshot: Snapshot::new(ver.current_snapshot_version()),

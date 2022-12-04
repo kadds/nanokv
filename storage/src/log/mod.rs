@@ -1,8 +1,4 @@
-use std::{
-    fs::{self, File},
-    io::{Read, Write},
-    path::PathBuf,
-};
+use std::io::{Read, Write};
 
 pub mod replayer;
 pub mod wal;

@@ -1,7 +1,7 @@
 use byteorder::{ByteOrder, WriteBytesExt};
 use bytes::{Buf, Bytes};
 use integer_encoding::{VarIntReader, VarIntWriter};
-use log::{debug, info};
+use log::debug;
 
 use crate::iterator::{EqualFilter, ScanIter};
 use crate::kv::superversion::Lifetime;
@@ -182,7 +182,7 @@ impl SSTReader for RawSSTReader {
         &self,
         opt: &crate::GetOption,
         key: Bytes,
-        lifetime: &Lifetime<'a>,
+        _lifetime: &Lifetime<'a>,
     ) -> Option<Value> {
         let ver = opt.snapshot().map(|v| v.version()).unwrap_or(u64::MAX);
         let mut index = self.inner.lower_bound(&key);
@@ -242,7 +242,7 @@ impl SSTReader for RawSSTReader {
         }
     }
 
-    fn raw_scan<'a>(&self, lifetime: &Lifetime<'a>) -> ScanIter<'a, KvEntry> {
+    fn raw_scan<'a>(&self, _lifetime: &Lifetime<'a>) -> ScanIter<'a, KvEntry> {
         let beg = 0;
         let end = self.inner.meta.total_keys;
         let reader = unsafe {
@@ -340,13 +340,13 @@ impl RawSSTEntry {
     }
 }
 
-impl Into<KvEntry> for RawSSTEntry {
-    fn into(self) -> KvEntry {
-        KvEntry {
-            key: self.key_bytes,
-            flags: self.flags,
-            ver: self.version,
-            value: self.value_bytes,
+impl From<RawSSTEntry> for KvEntry {
+    fn from(entry: RawSSTEntry) -> Self {
+        Self {
+            key: entry.key_bytes,
+            value: entry.value_bytes,
+            flags: entry.flags,
+            ver: entry.version,
         }
     }
 }

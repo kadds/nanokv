@@ -21,13 +21,11 @@ pub fn manifest_name(config: ConfigRef, seq: u64) -> PathBuf {
 }
 
 pub fn manifest_current(config: ConfigRef) -> PathBuf {
-    let base = config.path.join("manifest").join("current");
-    base
+    config.path.join("manifest").join("current")
 }
 
 pub fn manifest_current_tmp(config: ConfigRef) -> PathBuf {
-    let base = config.path.join("manifest").join("current_tmp");
-    base
+    config.path.join("manifest").join("current_tmp")
 }
 
 pub fn make_sure(config: ConfigRef) {
