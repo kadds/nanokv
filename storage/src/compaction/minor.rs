@@ -1,4 +1,10 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
 use log::info;
 use threadpool::ThreadPool;
@@ -17,6 +23,7 @@ use super::CompactSerializer;
 
 pub struct MinorSerializer {
     pool: ThreadPool,
+    stop: Arc<AtomicBool>,
 
     #[allow(unused)]
     manifest: Arc<Manifest>,
@@ -29,7 +36,12 @@ fn minor_compaction(
     config: ConfigRef,
     table: Arc<Imemtable>,
     f: Arc<dyn Fn(FileMetaData) + Sync + Send + 'static>,
+    stop_flag: Arc<AtomicBool>,
 ) {
+    if stop_flag.load(Ordering::SeqCst) {
+        return;
+    }
+
     info!("do minor compaction {}", table.seq());
     let meta = {
         let beg = Instant::now();
@@ -37,7 +49,12 @@ fn minor_compaction(
         let iter = table.entry_iter();
         let mut sst = sst::raw_sst::RawSSTWriter::new(fname::sst_name(config, table.seq()));
 
-        let meta = sst.write(0, seq, iter);
+        let meta = match sst.write(0, seq, iter, &stop_flag) {
+            Some(v) => v,
+            None => {
+                return;
+            }
+        };
 
         let end = Instant::now();
         info!("sst {} done, cost {}ms", seq, (end - beg).as_millis());
@@ -60,6 +77,7 @@ impl MinorSerializer {
             manifest,
             config,
             f: Arc::new(f),
+            stop: AtomicBool::new(false).into(),
         })
     }
 
@@ -67,20 +85,22 @@ impl MinorSerializer {
         let this = self.clone();
         let config = this.config;
         let f = this.f.clone();
+        let stop_flag = this.stop.clone();
         this.clone()
             .pool
-            .execute(|| minor_compaction(config, table, f));
+            .execute(move || minor_compaction(config, table, f, stop_flag));
     }
 }
 
 impl Drop for MinorSerializer {
     fn drop(&mut self) {
-        self.pool.join();
+        self.stop();
     }
 }
 
 impl CompactSerializer for MinorSerializer {
     fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
         self.pool.join();
     }
 }

@@ -45,15 +45,6 @@ pub fn load_config() -> Box<Config> {
     load_config_from("config.toml")
 }
 
-pub fn test_config() -> Box<Config> {
-    let cfg = Config {
-        path: "/tmp/nanokv/".into(),
-        no_wal: false,
-        ..Default::default()
-    };
-    cfg.into()
-}
-
 pub fn current_config() -> Box<Config> {
     let cfg = Config {
         path: "nanokv_data/".into(),
@@ -70,4 +61,14 @@ pub fn load_config_from(file: &str) -> Box<Config> {
         .unwrap();
 
     toml::from_str(&buf).unwrap()
+}
+
+pub fn test_config() -> Box<Config> {
+    let path = std::env::temp_dir();
+    let cfg = Config {
+        path,
+        no_wal: true,
+        ..Default::default()
+    };
+    cfg.into()
 }

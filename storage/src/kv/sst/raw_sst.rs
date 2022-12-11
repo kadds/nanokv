@@ -12,6 +12,7 @@ use byteorder::LE;
 use std::fs::File;
 use std::io::{self, BufWriter, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::{FileMetaData, SSTReader, SSTWriter};
@@ -419,22 +420,41 @@ impl RawSSTMetaInfo {
 
 pub struct RawSSTWriter {
     file: File,
+    name: PathBuf,
+    success: bool,
 }
 
 impl RawSSTWriter {
     pub fn new(name: PathBuf) -> Self {
-        let file = File::create(name).unwrap();
-        Self { file }
+        let file = File::create(&name).unwrap();
+        Self {
+            file,
+            name,
+            success: false,
+        }
     }
 }
 
-impl RawSSTWriter {}
+impl Drop for RawSSTWriter {
+    fn drop(&mut self) {
+        if !self.success {
+            let _ = std::fs::remove_file(&self.name);
+        }
+    }
+}
 
 impl SSTWriter for RawSSTWriter {
-    fn write<I>(&mut self, level: u32, seq: u64, iter: I) -> FileMetaData
+    fn write<I>(
+        &mut self,
+        level: u32,
+        seq: u64,
+        iter: I,
+        stop_flag: &AtomicBool,
+    ) -> Option<FileMetaData>
     where
         I: Iterator<Item = KvEntry>,
     {
+        self.success = false;
         let mut w = BufWriter::new(&mut self.file);
 
         let mut min_key = Bytes::new();
@@ -446,6 +466,7 @@ impl SSTWriter for RawSSTWriter {
         let mut max_ver = u64::MIN;
 
         let mut cur = 0;
+        let mut n = 0;
         for entry in iter {
             // write key value entry
             if min_key.is_empty() {
@@ -459,6 +480,12 @@ impl SSTWriter for RawSSTWriter {
 
             keys_offset.push(cur);
             cur += bytes;
+            n += 1;
+            if n % 4096 == 0 {
+                if stop_flag.load(Ordering::SeqCst) {
+                    return None;
+                }
+            }
         }
         if let Some(entry) = last_entry {
             max_key = entry.key();
@@ -489,7 +516,10 @@ impl SSTWriter for RawSSTWriter {
         w.flush().unwrap();
 
         debug!("write raw sst meta info {:?}", meta_info);
+        self.success = true;
 
-        FileMetaData::new(seq, min_key, max_key, min_ver, max_ver, keys, level)
+        Some(FileMetaData::new(
+            seq, min_key, max_key, min_ver, max_ver, keys, level,
+        ))
     }
 }

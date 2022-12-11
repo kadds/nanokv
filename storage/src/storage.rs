@@ -292,17 +292,12 @@ impl Storage {
         )
     }
 
-    pub fn set<K: Into<Bytes>>(
-        &mut self,
-        opt: &WriteOption,
-        key: K,
-        value: Bytes,
-    ) -> SetResult<u64> {
+    pub fn set<K: Into<Bytes>>(&self, opt: &WriteOption, key: K, value: Bytes) -> SetResult<u64> {
         self.set_by(opt, key, value, None, None)
     }
 
     pub fn set_by<K: Into<Bytes>>(
-        &mut self,
+        &self,
         opt: &WriteOption,
         key: K,
         value: Bytes,

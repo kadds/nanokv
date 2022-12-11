@@ -25,3 +25,10 @@ governor = "0.5"
 threadpool = "1"
 crossbeam = "0.8"
 arc-swap = "1.5"
+
+[dev-dependencies]
+criterion = "0.3"
+
+[[bench]]
+name = "bench"
+harness = false

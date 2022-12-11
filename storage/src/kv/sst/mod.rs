@@ -1,4 +1,7 @@
-use std::ops::{Bound, RangeBounds};
+use std::{
+    ops::{Bound, RangeBounds},
+    sync::atomic::AtomicBool,
+};
 
 use crate::{
     cache::Cache,
@@ -17,7 +20,13 @@ pub mod format;
 pub mod raw_sst;
 
 pub trait SSTWriter {
-    fn write<I>(&mut self, level: u32, seq: u64, iter: I) -> FileMetaData
+    fn write<I>(
+        &mut self,
+        level: u32,
+        seq: u64,
+        iter: I,
+        stop_flag: &AtomicBool,
+    ) -> Option<FileMetaData>
     where
         I: Iterator<Item = KvEntry>;
 }

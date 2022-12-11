@@ -1,5 +1,5 @@
 use std::sync::{
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicU32, Ordering},
     Arc,
 };
 
@@ -28,6 +28,7 @@ pub struct MajorSerializer {
     config: ConfigRef,
     f: Arc<dyn Fn(CompactSSTFiles, Vec<u64>) + Sync + Send + 'static>,
     factor: AtomicU32,
+    stop: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Default)]
@@ -43,7 +44,12 @@ fn major_compaction(
     config: ConfigRef,
     manifest: Arc<Manifest>,
     f: Arc<dyn Fn(CompactSSTFiles, Vec<u64>) + Sync + Send + 'static>,
+    stop_flag: Arc<AtomicBool>,
 ) {
+    if stop_flag.load(Ordering::SeqCst) {
+        return;
+    }
+
     info!("do major compaction {:?}", info);
 
     let removal = info
@@ -74,7 +80,12 @@ fn major_compaction(
 
     let iter = ScanIter::new(MergedIter::new(iters));
 
-    let meta = writer.write(info.level_top, new_seq, iter);
+    let meta = match writer.write(info.level_top, new_seq, iter, &stop_flag) {
+        Some(v) => v,
+        None => {
+            return;
+        }
+    };
 
     info!("major compaction {} done", new_seq);
     additional.push(meta);
@@ -97,6 +108,7 @@ impl MajorSerializer {
             config,
             f: Arc::new(f),
             factor: AtomicU32::new(10),
+            stop: AtomicBool::new(false).into(),
         })
     }
 
@@ -104,7 +116,9 @@ impl MajorSerializer {
         let f = self.f.clone();
         let config = self.config;
         let m = self.manifest.clone();
-        self.pool.execute(|| major_compaction(info, config, m, f))
+        let stop_flag = self.stop.clone();
+        self.pool
+            .execute(|| major_compaction(info, config, m, f, stop_flag))
     }
 
     pub fn notify(&self, sv: &SuperVersion) {
@@ -123,12 +137,13 @@ impl MajorSerializer {
 
 impl Drop for MajorSerializer {
     fn drop(&mut self) {
-        self.pool.join();
+        self.stop();
     }
 }
 
 impl CompactSerializer for MajorSerializer {
     fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
         self.pool.join();
     }
 }
