@@ -6,27 +6,27 @@ use std::{
 
 use log::info;
 
-use crate::{config::ConfigRef, kv::manifest::Manifest, storage::Storage, util::fname};
+use crate::{config::ConfigRef, kv::manifest::Manifest, storage::Storage, util::fname, backend::Backend};
 
 #[allow(unused)]
 pub struct Instance {
     manifest: Arc<Manifest>,
     storage: Storage,
     conf: ConfigRef,
+    backend: Arc<Backend>,
 }
 
 impl Instance {
-    pub fn new(conf: ConfigRef) -> Self {
-        let dir = std::env::current_dir().unwrap();
-        info!("cwd {}", dir.to_str().unwrap());
+    pub fn new(conf: ConfigRef, backend: Arc<Backend>) -> Self {
         fname::make_sure(conf);
         fs::File::create(PathBuf::from(&conf.path).join("nanokv")).unwrap();
 
-        let manifest = Arc::new(Manifest::new(conf));
+        let manifest = Arc::new(Manifest::new(conf, backend.clone()));
         Self {
-            storage: Storage::new(conf, manifest.clone()),
+            storage: Storage::new(conf, manifest.clone(), backend.clone()),
             manifest,
             conf,
+            backend,
         }
     }
 
@@ -56,6 +56,4 @@ impl Instance {
     }
 
     pub fn compact_range(&self) {}
-
-    pub fn compact_config(&self, _io_limit: f32) {}
 }

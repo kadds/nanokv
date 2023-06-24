@@ -1,6 +1,9 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
+use ::storage::backend::fs::local::LocalFileBasedPersistBackend;
+use ::storage::backend::Backend;
+use ::storage::err::StorageError;
 use ::storage::*;
 use bytes::Bytes;
 use rand::distributions::Alphanumeric;
@@ -72,11 +75,10 @@ fn main() {
     env_logger::init();
     let mut config = config::current_config();
     config.set_no_wal(true);
-
-    let config = Box::leak(config);
+    let backend = Backend::new(LocalFileBasedPersistBackend);
 
     // Instance::clean(config);
-    let mut ins = Instance::new(config);
+    let storage = Storage::new(config, backend);
 
     let total_test: usize = 100_000;
 
@@ -90,15 +92,14 @@ fn main() {
                     let del_key = exist_keys.iter().next().unwrap().clone();
 
                     // make sure del_key exist
-                    if ins
-                        .mut_storage()
-                        .get(&GetOption::default(), del_key.clone())
-                        .is_none()
-                    {
-                        panic!("not found key {}", del_key);
+                    if let Err(e) = storage.get(&GetOption::default(), del_key.clone()) {
+                        if e == StorageError::KeyNotExist {
+                            panic!("not found key {}", del_key);
+                        }
+                        panic!("get error {:?}", e);
                     }
 
-                    ins.mut_storage()
+                    storage
                         .del(&WriteOption::default(), del_key.clone())
                         .unwrap();
 
@@ -115,15 +116,13 @@ fn main() {
 
                     let value = rand_value();
 
-                    ins.mut_storage()
+                    storage
                         .set(&WriteOption::default(), key.clone(), value.clone())
                         .unwrap();
 
                     if repeated() {
                         let value = rand_value();
-                        ins.mut_storage()
-                            .set(&WriteOption::default(), key, value)
-                            .unwrap();
+                        storage.set(&WriteOption::default(), key, value).unwrap();
                     }
                 }
             }
@@ -137,14 +136,12 @@ fn main() {
     let mut case = TestCase::new(
         || {
             for key in &exist_keys {
-                if ins
-                    .mut_storage()
-                    .get(&GetOption::default(), key.clone())
-                    .is_none()
-                {
-                    let _ = ins.mut_storage().get(&GetOption::with_debug(), key.clone());
-
-                    panic!("{} should be existed", key.clone())
+                if let Err(e) = storage.get(&GetOption::default(), key.clone()) {
+                    if e == StorageError::KeyNotExist {
+                        let _ = storage.get(&GetOption::with_debug(), key.clone());
+                        panic!("not found key {}", key);
+                    }
+                    panic!("get error {:?}", e);
                 }
             }
         },
@@ -157,17 +154,13 @@ fn main() {
     let mut case = TestCase::new(
         || {
             for key in &del_keys {
-                if ins
-                    .mut_storage()
-                    .get(&GetOption::default(), key.clone())
-                    .is_some()
-                {
-                    let value = ins
-                        .mut_storage()
-                        .get(&GetOption::with_debug(), key.clone())
-                        .unwrap();
+                if let Err(e) = storage.get(&GetOption::default(), key.clone()) {
+                    if e == StorageError::KeyNotExist {
+                        let value = storage.get(&GetOption::with_debug(), key.clone()).unwrap();
 
-                    panic!("{} ver {} should be deleted", key.clone(), value.version())
+                        panic!("{} should be deleted", key.clone());
+                    }
+                    panic!("get error {:?}", e);
                 }
             }
         },
@@ -179,13 +172,11 @@ fn main() {
 
     let keys = exist_keys.len() as u64;
 
-    let su_version = ins.storage().super_version();
+    let su_version = storage.super_version();
 
     let mut case = TestCase::new(
         || {
-            let iter = ins
-                .mut_storage()
-                .scan(&GetOption::default(), .., &su_version);
+            let iter = storage.scan(&GetOption::default(), .., &su_version);
 
             assert_eq!(
                 iter.count(),
@@ -201,10 +192,8 @@ fn main() {
 
     let mut case = TestCase::new(
         || {
-            let su_version = ins.storage().super_version();
-            let iter = ins
-                .mut_storage()
-                .scan(&GetOption::default(), .., &su_version);
+            let su_version = storage.super_version();
+            let iter = storage.scan(&GetOption::default(), .., &su_version);
             let mut v: Vec<String> = exist_keys.into_iter().collect();
             v.sort();
 

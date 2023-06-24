@@ -1,19 +1,19 @@
 #[derive(Debug, Default, Clone)]
 pub struct Snapshot {
-    ver: u64,
+    seq: u64,
 }
 
 impl Snapshot {
-    pub fn new(ver: u64) -> Self {
-        Self { ver }
+    pub fn new(seq: u64) -> Self {
+        Self { seq }
     }
-    pub fn version(&self) -> u64 {
-        self.ver
+    pub fn sequence(&self) -> u64 {
+        self.seq
     }
 }
 
 impl From<u64> for Snapshot {
-    fn from(ver: u64) -> Self {
-        Self { ver }
+    fn from(seq: u64) -> Self {
+        Self { seq }
     }
 }

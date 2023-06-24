@@ -10,77 +10,52 @@ use std::{
 use arc_swap::ArcSwap;
 use bytes::Bytes;
 use log::info;
+use ouroboros::self_referencing;
 
 use crate::{
+    backend::{Backend, BackendRef},
     cache::Cache,
-    compaction::{major::MajorSerializer, minor::MinorSerializer},
-    iterator::{MergedIter, ScanIter},
+    compaction::{major::MajorCompactionTaskPool, minor::MinorCompactionTaskPool},
+    err::{Result, StorageError},
+    iterator::{KvIteratorItem, MergedIter, ScanIter},
+    key::{KeyType, Value, WriteBatch, WriteBatchBuilder, WriteBatchLogSerializer},
     kv::{
-        imemtable::Imemtables, manifest::VersionEdit, sst::SnapshotTable,
-        superversion::SuperVersion, ColumnFamilyTables,
+        manifest::VersionEdit, sst::SnapshotTable, superversion::SuperVersion, ColumnFamilyTables,
+        Imemtables,
     },
-    log::{wal::INVALID_SEQ, LogReplayer},
+    log::LogReplayer,
     snapshot::Snapshot,
-    util::fname,
-    GetOption, WriteOption,
+    util::fname::{self, manifest_name, sst_name, wal_name},
+    Config, GetOption, WriteOption,
 };
 use crate::{
     compaction::CompactSerializer,
-    kv::{
-        manifest::Manifest, Imemtable, KvEntry, KvEntryLogSerializer, Memtable, SetError, SetResult,
-    },
+    kv::{manifest::Manifest, Imemtable, Memtable},
     log::LogWriter,
-    value::Value,
-    ConfigRef,
 };
 
-type Wal = LogWriter<KvEntry, KvEntryLogSerializer>;
+#[self_referencing]
+struct StorageInfoInner {
+    config: Config,
+    backend: Backend,
+    #[borrows(config, backend)]
+    #[not_covariant]
+    manifest: Manifest<'this>,
+    #[borrows(config, backend)]
+    #[not_covariant]
+    wal: Option<LogWriter<'this, WriteBatchLogSerializer>>,
+}
 
 struct StorageInner {
+    info: StorageInfoInner,
     tables: ArcSwap<ColumnFamilyTables>,
-    manifest: Arc<Manifest>,
-    wal: Option<Wal>,
     lock: Mutex<()>,
     step_version: AtomicU64,
     super_version: ArcSwap<SuperVersion>,
+    cache: Cache,
 }
 
 impl StorageInner {
-    pub fn new(seq: u64, config: ConfigRef, manifest: Arc<Manifest>, force_nowal: bool) -> Self {
-        let log_serializer = KvEntryLogSerializer::default();
-        let wal = if config.no_wal {
-            None
-        } else {
-            Some(if force_nowal {
-                LogWriter::new(
-                    config,
-                    log_serializer,
-                    INVALID_SEQ,
-                    Box::new(fname::wal_name),
-                )
-            } else {
-                LogWriter::new(config, log_serializer, seq, Box::new(fname::wal_name))
-            })
-        };
-        let tables = ArcSwap::new(Arc::new(ColumnFamilyTables {
-            memtable: Arc::new(Memtable::new(seq)),
-            imemtables: Imemtables::default(),
-        }));
-        let super_version = ArcSwap::new(Arc::new(SuperVersion {
-            cf_tables: tables.load().clone(),
-            sst_version: manifest.current(),
-            step_version: 0,
-        }));
-        Self {
-            tables,
-            manifest,
-            wal,
-            lock: Mutex::new(()),
-            step_version: AtomicU64::new(0),
-            super_version,
-        }
-    }
-
     pub fn super_version(&self) -> Arc<SuperVersion> {
         loop {
             let step = self.step_version.load(Ordering::SeqCst);
@@ -109,69 +84,117 @@ impl StorageInner {
 pub struct Storage {
     inner: Arc<StorageInner>,
 
-    serializer: Arc<MinorSerializer>,
-    major_serializer: Arc<MajorSerializer>,
-
-    config: ConfigRef,
-    cache: Cache,
+    serializer: Arc<MinorCompactionTaskPool>,
+    major_serializer: Arc<MajorCompactionTaskPool>,
 }
 
 impl Storage {
-    pub(crate) fn new(config: ConfigRef, manifest: Arc<Manifest>) -> Self {
-        let mut restore_seq = manifest.last_sst_sequence();
-        let (seq, need_restore) = if restore_seq > 0 {
-            restore_seq -= 1;
-            (restore_seq - 1, true)
-        } else {
-            let seq = manifest.allocate_sst_sequence();
-            (seq, false)
-        };
+    pub fn clear(config: Config) {}
 
-        let inner = Arc::new(StorageInner::new(seq, config, manifest, need_restore));
+    pub fn new(config: Config, backend: Backend) -> Self {
+        backend.fs.make_sure_dir(config.path.to_path_buf()).unwrap();
+        backend
+            .fs
+            .make_sure_dir(sst_name(&config, 0).parent().unwrap().to_path_buf())
+            .unwrap();
+        backend
+            .fs
+            .make_sure_dir(manifest_name(&config, 0).parent().unwrap().to_path_buf())
+            .unwrap();
+        backend
+            .fs
+            .make_sure_dir(wal_name(&config, 0).parent().unwrap().to_path_buf())
+            .unwrap();
+        // prepare dir
+        // fname::make_sure(conf);
+        // fs::File::create(PathBuf::from(&conf.path).join("nanokv")).unwrap();
+
+        // init manifest
+
+        let info = StorageInfoInner::new(
+            config.clone(),
+            backend,
+            |c, b| Manifest::new(&c, &b),
+            |c, b| {
+                if c.no_wal {
+                    None
+                } else {
+                    Some(LogWriter::new(&b, WriteBatchLogSerializer))
+                }
+            },
+        );
+        let (number, need_restore, sst_version) = info.with_manifest(|manifest| {
+            let mut restore_number = manifest.last_sst_number();
+            if restore_number > 0 {
+                restore_number -= 1;
+                (restore_number, true, manifest.current())
+            } else {
+                let number = manifest.allocate_sst_number();
+                (number, false, manifest.current())
+            }
+        });
+
+        let tables = ArcSwap::new(Arc::new(ColumnFamilyTables {
+            memtable: Arc::new(Memtable::new(number)),
+            imemtables: Imemtables::default(),
+        }));
+
+        let super_version = ArcSwap::new(Arc::new(SuperVersion {
+            cf_tables: tables.load().clone(),
+            sst_version,
+            step_version: 0,
+        }));
+        let inner = Arc::new(StorageInner {
+            tables,
+            super_version,
+            info,
+            lock: Mutex::new(()),
+            step_version: 0.into(),
+            cache: Cache::new(),
+        });
+        // init compaction thread pool
 
         let inner2 = inner.clone();
-        let serializer = MinorSerializer::new(config, inner.manifest.clone(), move |meta| {
-            let seq = meta.seq;
-            inner2.manifest.add_sst_with(meta, true, |current| {
-                inner2.modify_super_version(move |sv| SuperVersion {
-                    cf_tables: Arc::new(ColumnFamilyTables {
-                        memtable: sv.cf_tables.memtable.clone(),
-                        imemtables: sv.cf_tables.imemtables.remove(seq),
-                    }),
-                    sst_version: current,
-                    step_version: sv.step_version + 1,
-                });
+        let serializer = MinorCompactionTaskPool::new(&config, move |meta| {
+            inner2.info.with_manifest(|m| {
+                let number = meta.number;
+                m.add_sst_with(meta, true, |current| {
+                    inner2.modify_super_version(move |sv| SuperVersion {
+                        cf_tables: Arc::new(ColumnFamilyTables {
+                            memtable: sv.cf_tables.memtable.clone(),
+                            imemtables: sv.cf_tables.imemtables.remove(number),
+                        }),
+                        sst_version: current,
+                        step_version: sv.step_version + 1,
+                    });
+                })
             });
         });
 
         let inner2 = inner.clone();
-        let major_serializer = MajorSerializer::new(
-            config,
-            inner.manifest.clone(),
-            move |additional, removal| {
-                let mut vec = Vec::new();
-                for meta in additional {
-                    vec.push(VersionEdit::SSTAppended(meta));
-                }
-                for seq in removal {
-                    vec.push(VersionEdit::SSTRemove(seq));
-                }
-                inner2.manifest.modify_with(vec, |current| {
+        let major_serializer = MajorCompactionTaskPool::new(&config, move |additional, removal| {
+            let mut vec = Vec::new();
+            for meta in additional {
+                vec.push(VersionEdit::SSTAppended(meta));
+            }
+            for seq in removal {
+                vec.push(VersionEdit::SSTRemove(seq));
+            }
+            inner2.info.with_manifest(|m| {
+                m.modify_with(vec, |current| {
                     inner2.modify_super_version(move |sv| SuperVersion {
                         cf_tables: sv.cf_tables.clone(),
                         sst_version: current,
                         step_version: sv.step_version + 1,
                     });
-                });
-            },
-        );
+                })
+            });
+        });
 
         let mut this = Self {
             inner,
             serializer,
             major_serializer,
-            cache: Cache::new(config.clone()),
-            config,
         };
         if need_restore {
             this.restore();
@@ -187,66 +210,75 @@ impl Storage {
         key: K,
         super_version: &SuperVersion,
         snapshot: Snapshot,
-    ) -> Option<Value> {
+    ) -> Result<Value> {
         let lifetime = super_version.lifetime();
 
         let key = key.into();
         // query from memtable
-        if let Some(value) = super_version
+        match super_version
             .cf_tables
             .memtable
             .get(opt, key.clone(), &lifetime)
         {
-            if opt.debug() {
-                info!("find key {:?} in memtable", key);
+            Ok((internal_key, value)) => {
+                if opt.debug() {
+                    info!("find key {:?} in memtable", key);
+                }
+                if internal_key.key_type() == KeyType::Del {
+                    return Err(StorageError::KeyNotExist);
+                }
+                return Ok(value);
             }
-            if value.deleted() {
-                return None;
+            Err(e) => {
+                if StorageError::KeyNotExist == e {
+                    return Err(e);
+                }
             }
-            return Some(value);
         }
 
         // query from imemetable
-        if let Some(value) = super_version
+        match super_version
             .cf_tables
             .imemtables
             .get(opt, key.clone(), &lifetime)
         {
-            if opt.debug() {
-                info!("find key {:?} in imemtables", key);
+            Ok((internal_key, value)) => {
+                if opt.debug() {
+                    info!("find key {:?} in imemtables", key);
+                }
+                if internal_key.key_type() == KeyType::Del {
+                    return Err(StorageError::KeyNotExist);
+                }
+                return Ok(value);
             }
-
-            if value.deleted() {
-                return None;
+            Err(e) => {
+                if StorageError::KeyNotExist == e {
+                    return Err(e);
+                }
             }
-            return Some(value);
         }
 
-        if let Some(value) = SnapshotTable::new(
+        match SnapshotTable::new(
             snapshot,
             super_version.sst_version.clone(),
-            self.config,
-            &self.cache,
+            &self.inner.cache,
         )
-        .get(opt, key.clone(), &lifetime)
+        .get(opt, self.inner.info.borrow_config(), key.clone(), &lifetime)
         {
-            if opt.debug() {
-                info!("find key {:?} in sst", key);
+            Ok((internal_key, value)) => {
+                if internal_key.key_type() == KeyType::Del {
+                    return Err(StorageError::KeyNotExist);
+                }
+                return Ok(value);
             }
-            if value.deleted() {
-                return None;
-            }
-            return Some(value);
+            Err(e) => return Err(e),
         }
-
-        None
     }
 
-    pub fn get<K: Into<Bytes>>(&self, opt: &GetOption, key: K) -> Option<Value> {
+    pub fn get<K: Into<Bytes>>(&self, opt: &GetOption, key: K) -> Result<Value> {
         let inner = self.inner.as_ref();
         let super_version = self.super_version();
-        let snapshot_guard = inner.manifest.new_snapshot();
-        let snapshot = snapshot_guard.get();
+        let snapshot = inner.info.with_manifest(|m| m.snapshot());
         self.get_ex(opt, key, &super_version, snapshot)
     }
 
@@ -257,8 +289,7 @@ impl Storage {
         super_version: &'a SuperVersion,
     ) -> ScanIter<'a, (Bytes, Value)> {
         let inner = self.inner.as_ref();
-        let snapshot_guard = inner.manifest.new_snapshot();
-        let snapshot = snapshot_guard.get();
+        let snapshot = inner.info.with_manifest(|m| m.snapshot());
         self.scan_ex(opt, range, super_version, snapshot)
     }
 
@@ -278,81 +309,61 @@ impl Storage {
         iters.push(tables.imemtables.scan(opt, range.clone(), &lifetime));
 
         iters.push(
-            SnapshotTable::new(
-                snapshot,
-                super_version.sst_version.clone(),
-                self.config,
-                &self.cache,
-            )
-            .scan(opt, range, &lifetime),
+            SnapshotTable::new(snapshot, super_version.sst_version.clone(), &inner.cache).scan(
+                opt,
+                inner.info.borrow_config(),
+                range,
+                &lifetime,
+            ),
         );
 
         ScanIter::<'a, (Bytes, Value)>::new(
-            MergedIter::new(iters).filter(|(_, value)| !value.deleted()),
+            MergedIter::new(iters)
+                .filter(|(key, value)| key.key_type() != KeyType::Del)
+                .map(|(key, value)| (key.user_key(), value)),
         )
     }
 
-    pub fn set<K: Into<Bytes>>(&self, opt: &WriteOption, key: K, value: Bytes) -> SetResult<u64> {
-        self.set_by(opt, key, value, None, None)
-    }
-
-    pub fn set_by<K: Into<Bytes>>(
+    pub fn set<K: AsRef<[u8]>, V: AsRef<[u8]>>(
         &self,
         opt: &WriteOption,
         key: K,
-        value: Bytes,
-        ver: Option<u64>,
-        ttl: Option<Duration>,
-    ) -> SetResult<u64> {
-        if value.len() > 1024 * 1024 * 10 {
-            // 10MB value
-            return Err(SetError::ValueTooLarge);
-        }
-        let key = key.into();
+        value: V,
+    ) -> Result<u64> {
+        let mut batch = WriteBatchBuilder::default();
+        batch.set(key, value)?;
 
-        if let Some(ver) = ver {
-            let latest_ver = self
-                .get(&GetOption::default(), key.clone())
-                .ok_or(SetError::KeyNotExist)?
-                .version();
-            if latest_ver != ver {
-                return Err(SetError::VersionNotMatch(latest_ver));
-            }
-        };
+        self.set_batch(opt, batch.build())
+    }
 
+    pub fn del<K: AsRef<[u8]>>(&self, opt: &WriteOption, key: K) -> Result<u64> {
+        let mut batch = WriteBatchBuilder::default();
+        batch.del(key)?;
+
+        self.set_batch(opt, batch.build())
+    }
+
+    pub fn set_batch(&self, opt: &WriteOption, batch: WriteBatch) -> Result<u64> {
         let inner = self.inner.as_ref();
         let tables = inner.tables.load();
+        let cur_ver = inner
+            .info
+            .with_manifest(|m| m.allocate_seq(batch.count() as u64));
 
-        let cur_ver = inner.manifest.allocate_version(1);
-        let entry = KvEntry::new(key.clone(), value, ttl.map(|d| d.as_secs()), cur_ver);
-
-        if let Some(wal) = &inner.wal {
-            wal.append(&entry);
-            if opt.fsync() {
-                wal.sync();
+        inner.info.with_wal(|wal| {
+            if let Some(wal) = &wal {
+                wal.append(&batch);
+                if opt.fsync() {
+                    wal.sync();
+                }
             }
-        }
+        });
 
-        tables.memtable.set(opt, entry)?;
+        tables.memtable.set_batch(batch)?;
         if tables.memtable.full() {
-            if opt.debug() {
-                info!("{:?} need flush", key);
-            }
             self.flush_memtable();
         }
         self.major_serializer.notify(&inner.super_version());
-        Ok(cur_ver)
-    }
-
-    pub fn del<S: Into<String>>(&mut self, opt: &WriteOption, key: S) -> SetResult<u64> {
-        let inner = self.inner.as_ref();
-        let cur_ver = inner.manifest.allocate_version(1);
-
-        let entry = KvEntry::new_del(key.into(), cur_ver);
-        let inner = self.inner.as_ref();
-        let tables = inner.tables.load();
-        tables.memtable.set(opt, entry)?;
-
         Ok(cur_ver)
     }
 
@@ -363,17 +374,25 @@ impl Storage {
 
 impl Storage {
     fn restore(&mut self) {
-        let log_serializer = KvEntryLogSerializer::default();
+        let config = self.inner.info.borrow_config();
         let tables = self.inner.tables.load();
-        LogReplayer::new(
-            log_serializer,
-            fname::wal_name(self.config, tables.memtable.seq()),
-        )
-        .execute(0, |_, entry| {
-            tables.memtable.set(&WriteOption::default(), entry).unwrap()
-        });
+        let replayer = LogReplayer::new(self.inner.info.borrow_backend(), WriteBatchLogSerializer);
+        let iter = match replayer.iter(wal_name(config, tables.memtable.number())) {
+            Ok(e) => e,
+            Err(e) => {
+                if e.is_io_not_found() {
+                    return;
+                } else {
+                    panic!("{:?}", e);
+                }
+            }
+        };
 
-        info!("wal restore from {}", tables.memtable.seq());
+        for batch in iter {
+            tables.memtable.set_batch(batch.unwrap()).unwrap()
+        }
+
+        info!("wal restore from {}", tables.memtable.max_seq());
         self.flush_memtable();
     }
 
@@ -381,27 +400,27 @@ impl Storage {
     pub(crate) fn flush_memtable(&self) {
         let inner = self.inner.as_ref();
         let tables = inner.tables.load();
-        if !tables.memtable.is_empty() {
-            let new_seq = inner.manifest.allocate_sst_sequence();
+        // if !tables.memtable.is_empty() {
+        //     let new_seq = inner.manifest.allocate_sst_sequence();
 
-            let imemtable = Arc::new(Imemtable::new(&tables.memtable, u64::MAX));
-            let target = imemtable.clone();
-            let cf_tables = Arc::new(ColumnFamilyTables {
-                memtable: Arc::new(Memtable::new(new_seq)),
-                imemtables: tables.imemtables.push(imemtable),
-            });
-            let t = cf_tables;
+        //     let imemtable = Arc::new(Imemtable::new(tables.memtable));
+        //     let target = imemtable.clone();
+        //     let cf_tables = Arc::new(ColumnFamilyTables {
+        //         memtable: Arc::new(Memtable::new()),
+        //         imemtables: tables.imemtables.push(imemtable),
+        //     });
+        //     let t = cf_tables;
 
-            inner.modify_super_version(move |sv| SuperVersion {
-                cf_tables: t,
-                sst_version: sv.sst_version.clone(),
-                step_version: sv.step_version + 1,
-            });
+        //     inner.modify_super_version(move |sv| SuperVersion {
+        //         cf_tables: t,
+        //         sst_version: sv.sst_version.clone(),
+        //         step_version: sv.step_version + 1,
+        //     });
 
-            drop(tables);
+        //     drop(tables);
 
-            self.serializer.compact_async(target);
-        }
+        //     self.serializer.compact_async(target);
+        // }
     }
 
     pub(crate) fn flush_wait_imemtables(&mut self) {
@@ -422,9 +441,11 @@ impl Storage {
         self.flush_wait_imemtables();
 
         self.serializer.stop();
-        self.inner.manifest.flush();
+        self.inner.info.with_manifest(|m| m.flush());
     }
 }
+
+impl Storage {}
 
 impl Drop for Storage {
     fn drop(&mut self) {

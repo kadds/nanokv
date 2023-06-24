@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     ops::RangeBounds,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -9,129 +8,66 @@ use std::{
 
 use bytes::Bytes;
 
-use super::{superversion::Lifetime, GetOption, KvEntry, Memtable};
+use super::{superversion::Lifetime, GetOption, Memtable};
 use crate::{
-    iterator::{EqualFilter, MergedIter, ScanIter},
-    kv::kv_entry_ref_to_value,
-    value::Value,
+    err::{Result, StorageError},
+    iterator::{EqualFilter, KvIteratorItem, MergedIter, ScanIter},
+    key::{InternalKey, Value},
 };
-use superslice::*;
 
 #[derive(Debug)]
 pub struct Imemtable {
-    keys: Vec<KvEntry>,
-    seq: u64,
-
-    min_ver: u64,
-    max_ver: u64,
-    flushed: AtomicBool,
+    m: Memtable,
 }
 
 impl Imemtable {
-    pub fn new(memtable: &Memtable, reserved_version: u64) -> Self {
-        let seq = memtable.seq();
-        let cap = memtable.len();
-        let mut keys = Vec::with_capacity(cap);
-        let mut min_ver = u64::MAX;
-        let mut max_ver = u64::MIN;
-
-        for item in memtable.iter() {
-            min_ver = min_ver.min(item.version());
-            max_ver = max_ver.max(item.version());
-            keys.push(item.to_owned());
-        }
-
-        let mut map = HashSet::new();
-        let new_keys = keys
-            .into_iter()
-            .filter(|item| {
-                if item.version() < reserved_version {
-                    match map.get(&item.key) {
-                        Some(_) => false,
-                        None => {
-                            map.insert(item.key.clone());
-                            true
-                        }
-                    }
-                } else {
-                    true
-                }
-            })
-            .collect();
-        keys = new_keys;
-
-        Self {
-            keys,
-            seq,
-            min_ver,
-            max_ver,
-            flushed: AtomicBool::new(false),
-        }
+    pub fn new(memtable: Memtable) -> Self {
+        Self { m: memtable }
     }
 }
 
 impl Imemtable {
-    pub fn min_max(&self) -> Option<(Bytes, Bytes)> {
-        if !self.keys.is_empty() {
-            Some((
-                self.keys.first().unwrap().key(),
-                self.keys.last().unwrap().key(),
-            ))
+    pub fn min_max_user_key(&self) -> Option<(Bytes, Bytes)> {
+        if !self.m.is_empty() {
+            Some((self.m.first_key().user_key(), self.m.last_key().user_key()))
         } else {
             None
         }
-    }
-    pub fn min_max_ver(&self) -> Option<(u64, u64)> {
-        if !self.keys.is_empty() {
-            Some((self.min_ver, self.max_ver))
-        } else {
-            None
-        }
-    }
-    pub fn entry_iter<'a>(&'a self) -> Box<dyn Iterator<Item = KvEntry> + 'a> {
-        Box::new(self.keys.iter().cloned())
     }
 
-    pub fn seq(&self) -> u64 {
-        self.seq
+    pub fn min_seq(&self) -> u64 {
+        self.m.min_seq()
+    }
+
+    pub fn max_seq(&self) -> u64 {
+        self.m.max_seq()
+    }
+
+    pub fn entry_iter<'a>(&'a self) -> Box<dyn Iterator<Item = (InternalKey, Bytes)> + 'a> {
+        Box::new(self.m.iter().cloned())
     }
 
     pub fn len(&self) -> usize {
-        self.keys.len()
+        self.m.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.keys.is_empty()
+        self.m.is_empty()
     }
 
-    pub fn set_flush(&self) {
-        self.flushed.store(true, Ordering::Relaxed);
-    }
-
-    pub fn is_flushed(&self) -> bool {
-        self.flushed.load(Ordering::Relaxed)
+    pub fn number(&self) -> u64 {
+        self.m.number()
     }
 }
 
 impl Imemtable {
-    pub fn get<'a>(&self, opt: &GetOption, key: Bytes, _lifetime: &Lifetime<'a>) -> Option<Value> {
-        let mut range = self.keys.equal_range_by(|entry| entry.key().cmp(&key));
-
-        if range.is_empty() {
-            return None;
-        }
-
-        if let Some(snapshot) = &opt.snapshot() {
-            for idx in range {
-                if self.keys[idx].version() <= snapshot.version() {
-                    return Some(Value::from_entry(&self.keys[idx]));
-                }
-            }
-        } else {
-            let idx = unsafe { range.next().unwrap_unchecked() };
-            return Some(Value::from_entry(&self.keys[idx]));
-        }
-        None
+    pub fn get<'a>(
+        &self,
+        opt: &GetOption,
+        key: Bytes,
+        _lifetime: &Lifetime<'a>,
+    ) -> Result<(InternalKey, Value)> {
+        self.m.get(opt, key, _lifetime)
     }
 
     pub fn scan<'a, R: RangeBounds<Bytes> + Clone>(
@@ -139,33 +75,8 @@ impl Imemtable {
         opt: &GetOption,
         range: R,
         _mark: &Lifetime<'a>,
-    ) -> ScanIter<'a, (Bytes, Value)> {
-        use std::ops::Bound::*;
-        let beg = match range.start_bound() {
-            Included(val) => self.keys.lower_bound_by(|entry| entry.key().cmp(val)),
-            Excluded(val) => self.keys.upper_bound_by(|entry| entry.key().cmp(val)),
-            Unbounded => 0,
-        };
-        let end = match range.end_bound() {
-            Included(val) => self.keys.upper_bound_by(|entry| entry.key().cmp(val)),
-            Excluded(val) => self.keys.lower_bound_by(|entry| entry.key().cmp(val)),
-            Unbounded => self.keys.len(),
-        };
-        let keys = self.keys.clone();
-        let slice = unsafe { core::mem::transmute::<_, &'static [KvEntry]>(&keys[beg..end]) };
-        if let Some(snapshot) = opt.snapshot() {
-            let snapshot_ver = snapshot.version();
-            ScanIter::new(
-                EqualFilter::new(
-                    slice
-                        .iter()
-                        .filter(move |entry| entry.version() <= snapshot_ver),
-                )
-                .map(kv_entry_ref_to_value),
-            )
-        } else {
-            ScanIter::new(EqualFilter::new(slice.iter()).map(kv_entry_ref_to_value))
-        }
+    ) -> ScanIter<'a, (InternalKey, Value)> {
+        self.m.scan(opt, range, _mark)
     }
 }
 
@@ -190,9 +101,13 @@ impl Imemtables {
         Self { imemtables }
     }
 
-    pub fn remove(&self, seq: u64) -> Self {
+    pub fn remove(&self, number: u64) -> Self {
         let mut imemtables = self.imemtables.clone();
-        if let Some(idx) = imemtables.iter().enumerate().find(|val| val.1.seq() == seq) {
+        if let Some(idx) = imemtables
+            .iter()
+            .enumerate()
+            .find(|val| val.1.number() == number)
+        {
             imemtables.remove(idx.0);
         }
         Self { imemtables }
@@ -200,13 +115,23 @@ impl Imemtables {
 }
 
 impl Imemtables {
-    pub fn get<'a>(&self, opt: &GetOption, key: Bytes, lifetime: &Lifetime<'a>) -> Option<Value> {
+    pub fn get<'a>(
+        &self,
+        opt: &GetOption,
+        key: Bytes,
+        lifetime: &Lifetime<'a>,
+    ) -> Result<(InternalKey, Value)> {
         for table in self.imemtables.iter().rev() {
-            if let Some(value) = table.get(opt, key.clone(), lifetime) {
-                return Some(value);
+            match table.get(opt, key.clone(), lifetime) {
+                Ok(value) => return Ok(value),
+                Err(e) => {
+                    if let StorageError::KeyNotExist = e {
+                        return Err(e);
+                    }
+                }
             }
         }
-        None
+        Err(StorageError::KeyNotExist)
     }
 
     pub fn scan<'a, R: RangeBounds<Bytes> + Clone>(
@@ -214,7 +139,7 @@ impl Imemtables {
         opt: &GetOption,
         range: R,
         lifetime: &Lifetime<'a>,
-    ) -> ScanIter<'a, (Bytes, Value)> {
+    ) -> ScanIter<'a, (InternalKey, Value)> {
         let mut iters = Vec::new();
         for table in self.imemtables.iter().rev() {
             iters.push(table.scan(opt, range.clone(), lifetime));
@@ -226,6 +151,8 @@ impl Imemtables {
 
 #[cfg(test)]
 mod test {
+    use crate::iterator::KvIteratorItem;
+
     use super::*;
 
     #[test]
@@ -237,13 +164,13 @@ mod test {
 
         // basic get
         assert_eq!(
-            table.get(&opt, "101".into(), &lifetime).unwrap().version(),
+            table.get(&opt, "101".into(), &lifetime).unwrap().seq(),
             sorted_input[1].1
         );
 
         // multi-version get
         let v3 = table.get(&opt, "133".into(), &lifetime);
-        assert_eq!(v3.unwrap().version(), ver - 3);
+        assert_eq!(v3.unwrap().seq(), ver - 3);
 
         // get snapshot
         let v3 = table.get(
@@ -251,23 +178,23 @@ mod test {
             "133".into(),
             &lifetime,
         );
-        assert_eq!(v3.unwrap().version(), sorted_input[33].1);
+        assert_eq!(v3.unwrap().seq(), sorted_input[33].1);
         let v3 = table.get(
             &GetOption::with_snapshot(sorted_input[33].1),
             "133".into(),
             &lifetime,
         );
-        assert_eq!(v3.unwrap().version(), sorted_input[33].1);
+        assert_eq!(v3.unwrap().seq(), sorted_input[33].1);
 
         // get deleted
         let v4 = table.get(&opt, "144".into(), &lifetime);
         assert!(v4.unwrap().deleted());
 
         let v4 = table.get(&GetOption::with_snapshot(ver - 2), "144".into(), &lifetime);
-        assert_eq!(v4.unwrap().version(), ver - 4);
+        assert_eq!(v4.unwrap().seq(), ver - 4);
 
         let v4 = table.get(&GetOption::with_snapshot(ver - 5), "144".into(), &lifetime);
-        assert_eq!(v4.unwrap().version(), sorted_input[44].1);
+        assert_eq!(v4.unwrap().seq(), sorted_input[44].1);
 
         // set & delete & set
 
@@ -288,14 +215,14 @@ mod test {
         assert_eq!(
             table
                 .scan(&opt, .., &lifetime)
-                .filter(|(_, v)| !v.deleted())
+                .filter(|(k, v)| !k.deleted())
                 .count(),
             199
         );
 
         // scan all
         for (idx, entry) in table.scan(&opt, .., &lifetime).enumerate() {
-            assert_eq!(sorted_input[idx].0, entry.0);
+            assert_eq!(sorted_input[idx].0, entry.0.user_key());
         }
     }
 }

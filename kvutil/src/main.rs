@@ -4,6 +4,9 @@ use bytes::Bytes;
 use clap::Parser;
 use opt::ManifestCommands;
 use storage::{
+    backend::{fs::local::LocalFileBasedPersistBackend, Backend, BackendRef},
+    iterator::KvIteratorItem,
+    key::{InternalKey, KeyType, Value},
     kv::{
         manifest::{ManifestLogSerializer, VersionSet},
         sst::SSTReader,
@@ -42,7 +45,7 @@ fn sst_summary(path: PathBuf) {
 
     println!(
         "seq:level {}:{}, keys {}, version {}, index offset {}\nmin {:?}\nmax {:?}",
-        meta.seq, meta.level, meta.total_keys, meta.version, meta.index_offset, min, max
+        meta.number, meta.level, meta.total_keys, meta.version, meta.index_offset, min, max
     )
 }
 
@@ -74,17 +77,27 @@ fn sst_get(path: PathBuf, key: Bytes, noval: bool) {
     }
 }
 
-fn print_item(key: Bytes, mut value: storage::Value, noval: bool) {
+fn print_item(key: InternalKey, value: Value, noval: bool) {
     if noval {
-        if value.deleted() {
-            println!("del,{},{:?}", value.version(), key)
+        if key.key_type() == KeyType::Del {
+            println!("del,{},{:?}", key.seq(), key.user_key_slice())
         } else {
-            println!("exist,{},{:?}", value.version(), key);
+            println!("exist,{},{:?}", key.seq(), key.user_key_slice());
         }
-    } else if value.deleted() {
-        println!("del,{},{:?},{:?}", value.version(), key, value.value())
+    } else if key.key_type() == KeyType::Del {
+        println!(
+            "del,{},{:?},{:?}",
+            key.seq(),
+            key.user_key_slice(),
+            value.data()
+        )
     } else {
-        println!("exist,{},{:?},{:?}", value.version(), key, value.value());
+        println!(
+            "exist,{},{:?},{:?}",
+            key.seq(),
+            key.user_key_slice(),
+            value.data()
+        );
     }
 }
 
@@ -112,14 +125,20 @@ fn dump_manifest(base: String, show_step: bool) {
     let seq = show_current(base.clone());
     let mut name = PathBuf::from(base).join("manifest").join(seq.to_string());
     name.set_extension("log");
+    let backend = Backend::new(LocalFileBasedPersistBackend);
 
-    let mut r = LogReplayer::new(ManifestLogSerializer::default(), name);
-    let final_state = r.execute(VersionSet::default(), |state, edit| {
-        if show_step {
-            println!("{:?}", edit);
+    let final_state = {
+        let mut r = LogReplayer::new(&backend, ManifestLogSerializer);
+        let mut state = VersionSet::default();
+        for edit in r.iter(name).unwrap() {
+            let edit = edit.unwrap();
+            if show_step {
+                println!("{:?}", edit);
+            }
+            state.add(&edit);
         }
-        state.add(&edit);
-    });
+        state
+    };
     println!("{:?}", final_state);
 }
 

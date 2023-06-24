@@ -1,7 +1,10 @@
 use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, Criterion};
 use rand::{distributions::Alphanumeric, Rng, RngCore};
-use storage::{config, Config, Instance, WriteOption};
+use storage::{
+    backend::{fs::local::LocalFileBasedPersistBackend, Backend},
+    config, Config, Storage, WriteOption,
+};
 
 fn rand_key() -> String {
     let mut rng = rand::thread_rng();
@@ -27,15 +30,13 @@ fn kv_read(c: &mut Criterion) {}
 fn kv_write(c: &mut Criterion) {
     c.bench_function("write", |b| {
         let config = config::test_config();
-        let config = Box::leak(config);
-        let ins = Instance::new(config);
+        let backend = Backend::new(LocalFileBasedPersistBackend);
+        let storage = Storage::new(config, backend);
 
         b.iter(|| {
             let key = rand_key();
             let value = rand_value();
-            ins.storage()
-                .set(&WriteOption::default(), key, value)
-                .unwrap();
+            storage.set(&WriteOption::default(), key, value).unwrap();
         });
     });
 }

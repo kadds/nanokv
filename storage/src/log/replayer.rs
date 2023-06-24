@@ -1,110 +1,208 @@
 use std::{
     fs::File,
-    io::{BufReader, Read},
+    io::{self, BufReader, Read},
     marker::PhantomData,
     path::PathBuf,
+    sync::Arc,
 };
 
 use byteorder::{ReadBytesExt, LE};
-use bytes::Buf;
+use bytes::{
+    buf::{Reader, Writer},
+    Buf, BufMut, BytesMut,
+};
 
-use crate::util::crc::crc_unmask;
+use crate::{
+    backend::{fs::ReadablePersist, Backend, BackendRef},
+    err::Result,
+    util::crc::crc_unmask,
+};
 
-use super::{LogEntrySerializer, LogSegmentFlags, SEGMENT_CONTENT_SIZE};
+use super::{LogEntrySerializer, LogSegmentFlags, SEGMENT_SIZE};
 
-pub struct LogReplayer<E, S> {
-    current: Option<File>,
+pub trait SegmentRead: Read {}
 
-    serializer: S,
+pub struct SegmentReader<'a, R> {
+    r: R,
+    cache: &'a mut [u8],
+    done: bool,
+    flags: u8,
+    length: u16,
+    pos: usize,
+}
+
+impl<'a, R> SegmentRead for SegmentReader<'a, R> where R: Read {}
+
+impl<'a, R> SegmentReader<'a, R>
+where
+    R: Read,
+{
+    pub fn new(r: R, segment_size: u64, cache: &'a mut [u8]) -> Self {
+        assert_eq!(segment_size, cache.len() as u64);
+        Self {
+            r,
+            cache,
+            done: false,
+            flags: 0,
+            length: 0,
+            pos: 0,
+        }
+    }
+
+    pub fn pre_read(&mut self) -> io::Result<()> {
+        self.r.read_exact(self.cache)?;
+
+        let mut r = self.cache.reader();
+        let crc_value = crc_unmask(r.read_u32::<LE>().unwrap());
+        let flags = r.read_u8()?;
+        let _ = r.read_u8()?; // reserved
+        let length = r.read_u16::<LE>()?;
+
+        if flags == LogSegmentFlags::UNKNOWN.bits() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "get segment flags eof",
+            ));
+        }
+
+        let mut crc_builder = crc32fast::Hasher::new();
+        crc_builder.update(&[0; 4]); // crc placeholder
+        crc_builder.update(&self.cache[4..(4 + length + 4) as usize]);
+        let calculate_crc_value = crc_builder.finalize();
+        if crc_value != calculate_crc_value {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "crc not match"));
+        }
+
+        if self.flags == LogSegmentFlags::FULL_FRAGMENT.bits() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "get flags not expect",
+            ));
+        }
+        if (self.flags == LogSegmentFlags::BEGIN_FRAGMENT.bits()
+            || self.flags == LogSegmentFlags::CONTINUE_FRAGMENT.bits())
+            && (flags != LogSegmentFlags::LAST_FRAGMENT.bits()
+                && flags != LogSegmentFlags::CONTINUE_FRAGMENT.bits())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "get flags not expect",
+            ));
+        }
+
+        if flags == LogSegmentFlags::LAST_FRAGMENT.bits()
+            || flags == LogSegmentFlags::FULL_FRAGMENT.bits()
+        {
+            self.done = true;
+        }
+
+        self.flags = flags;
+        self.length = length;
+        self.pos = 0;
+        Ok(())
+    }
+}
+
+impl<'a, R> Read for SegmentReader<'a, R>
+where
+    R: Read,
+{
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut buf_offset = 0 as usize;
+        loop {
+            if buf_offset == buf.len() {
+                break;
+            }
+            let mut cache_can_read = self.length as usize - self.pos;
+            if cache_can_read == 0 {
+                if self.done {
+                    if buf_offset > 0 {
+                        break;
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "get segment eof",
+                    ));
+                }
+                self.pre_read()?;
+                cache_can_read = self.length as usize - self.pos;
+            }
+
+            let buf_can_read = buf.len() - buf_offset;
+            let target_read = buf_can_read.min(cache_can_read);
+
+            self.cache[(8 + self.pos)..]
+                .reader()
+                .read_exact(&mut buf[buf_offset..(buf_offset + target_read)])?;
+
+            buf_offset += target_read;
+            self.pos += target_read;
+        }
+        Ok(buf_offset)
+    }
+}
+
+pub struct LogReplayerIter<'a, S, E> {
+    underlying: Box<dyn ReadablePersist>,
+    cache: Vec<u8>,
+    serializer: &'a S,
     _pd: PhantomData<E>,
 }
 
-impl<E, S> LogReplayer<E, S>
+impl<'a, S, E> Iterator for LogReplayerIter<'a, S, E>
 where
     S: LogEntrySerializer<Entry = E>,
 {
-    pub fn new(serializer: S, path: PathBuf) -> Self {
-        let current = File::open(path).ok();
-        Self {
-            current,
+    type Item = Result<E>;
 
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut r = SegmentReader::new(
+            self.underlying.as_mut(),
+            SEGMENT_SIZE as u64,
+            &mut self.cache,
+        );
+        let entry = match self.serializer.read(&mut r) {
+            Ok(e) => e,
+            Err(err) => {
+                if err.kind() == io::ErrorKind::UnexpectedEof {
+                    return None;
+                } else {
+                    return Some(Err(crate::err::StorageError::Io(err)));
+                }
+            }
+        };
+        Some(Ok(entry))
+    }
+}
+
+pub struct LogReplayer<'a, S> {
+    serializer: S,
+    backend: &'a Backend,
+}
+
+impl<'a, E, S> LogReplayer<'a, S>
+where
+    S: LogEntrySerializer<Entry = E>,
+{
+    pub fn new(backend: &'a Backend, serializer: S) -> Self {
+        Self {
             serializer,
-            _pd: PhantomData::default(),
+            backend,
         }
     }
-    pub fn execute<F, ST>(&mut self, mut init_state: ST, mut f: F) -> ST
+
+    pub fn iter<P>(&self, path: P) -> Result<LogReplayerIter<S, E>>
     where
-        F: FnMut(&mut ST, E),
+        P: Into<PathBuf>,
     {
-        let file = match &mut self.current {
-            Some(file) => file,
-            None => return init_state,
-        };
-        let mut file_reader = BufReader::new(file);
-        let mut buf = Vec::with_capacity(SEGMENT_CONTENT_SIZE);
-        let mut need_end_flag = false;
-        let mut done = false;
-
-        loop {
-            let crc_value = crc_unmask(file_reader.read_u32::<LE>().unwrap());
-            let length = file_reader.read_u16::<LE>().unwrap();
-            let flags = file_reader.read_u8().unwrap();
-            let pos = buf.len();
-            if flags == 0 {
-                break;
-            }
-            if flags == LogSegmentFlags::FULL_FRAGMENT.bits {
-                if need_end_flag {
-                    panic!("flags check fail");
-                }
-                buf.resize(length as usize, 0);
-                file_reader.read_exact(&mut buf).unwrap();
-                done = true;
-            } else if flags == LogSegmentFlags::BEGIN_FRAGMENT.bits {
-                if need_end_flag {
-                    panic!("flags check fail");
-                }
-                need_end_flag = true;
-                buf.resize(length as usize, 0);
-                file_reader.read_exact(&mut buf).unwrap();
-            } else {
-                if !need_end_flag {
-                    panic!("flags check fail");
-                }
-                if flags == LogSegmentFlags::MIDDLE_FRAGMENT.bits {
-                    buf.resize(pos + length as usize, 0);
-                    file_reader.read_exact(&mut buf[pos..]).unwrap();
-                } else if flags == LogSegmentFlags::LAST_FRAGMENT.bits {
-                    done = true;
-                    need_end_flag = false;
-
-                    buf.resize(pos + length as usize, 0);
-                    file_reader.read_exact(&mut buf[pos..]).unwrap();
-                } else {
-                    break;
-                }
-            }
-            // crc check
-
-            let mut crc_builder = crc32fast::Hasher::new();
-            crc_builder.update(&buf[pos..]);
-            let calc_crc_value = crc_builder.finalize();
-            if crc_value != calc_crc_value {
-                panic!("crc check fail {} != {}", crc_value, calc_crc_value);
-            }
-
-            if done {
-                let mut buf_reader = BufReader::new(buf.reader());
-                done = false;
-
-                if let Some(e) = self.serializer.read(&mut buf_reader) {
-                    f(&mut init_state, e);
-                } else {
-                    break;
-                }
-                buf.clear();
-            }
-        }
-        init_state
+        let underlying = self.backend.fs.open(path.into(), false)?;
+        let mut cache = vec![];
+        cache.resize(SEGMENT_SIZE, 0);
+        Ok(LogReplayerIter {
+            underlying,
+            cache,
+            serializer: &self.serializer,
+            _pd: PhantomData::default(),
+        })
     }
 }

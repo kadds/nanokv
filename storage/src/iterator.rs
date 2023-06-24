@@ -2,13 +2,17 @@ use std::{collections::BinaryHeap, marker::PhantomData};
 
 use bytes::Bytes;
 
+use crate::key::InternalKey;
+
 pub trait KvIterator: Iterator {
     fn prefetch(&mut self, n: usize);
 }
 
-pub trait KvIteratorItem {
-    fn key(&self) -> &Bytes;
-    fn version(&self) -> u64;
+pub trait KvIteratorItem: Clone {
+    fn user_key_slice(&self) -> &[u8];
+    fn user_key(&self) -> Bytes;
+    fn seq(&self) -> u64;
+    fn deleted(&self) -> bool;
 }
 
 struct MergedItem<T> {
@@ -21,8 +25,8 @@ where
     T: KvIteratorItem,
 {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match self.t.key().cmp(other.t.key()) {
-            std::cmp::Ordering::Equal => self.t.version().cmp(&other.t.version()),
+        match self.t.user_key_slice().cmp(other.t.user_key_slice()) {
+            std::cmp::Ordering::Equal => self.t.seq().cmp(&other.t.seq()),
             std::cmp::Ordering::Less => std::cmp::Ordering::Greater,
             std::cmp::Ordering::Greater => std::cmp::Ordering::Less,
         }
@@ -36,7 +40,7 @@ where
     T: KvIteratorItem,
 {
     fn eq(&self, other: &Self) -> bool {
-        self.t.key() == other.t.key() && self.t.version() == other.t.version()
+        self.t.user_key_slice() == other.t.user_key_slice() && self.t.seq() == other.t.seq()
     }
 }
 
@@ -103,11 +107,11 @@ where
                 });
             }
             if let Some(last_key) = &self.last_key {
-                if last_key == item.t.key() {
+                if last_key == item.t.user_key_slice() {
                     continue;
                 }
             }
-            self.last_key = Some(item.t.key().clone());
+            self.last_key = Some(item.t.user_key());
             break Some(item.t);
         }
     }
@@ -140,10 +144,6 @@ impl<'a, T> Iterator for ScanIter<'a, T> {
     }
 }
 
-pub trait EqualKey {
-    fn equal_key(&self, other: &Self) -> bool;
-}
-
 pub struct EqualFilter<I>
 where
     I: Iterator,
@@ -155,7 +155,7 @@ where
 impl<I> EqualFilter<I>
 where
     I: Iterator,
-    I::Item: EqualKey,
+    I::Item: KvIteratorItem,
 {
     pub(crate) fn new(iter: I) -> Self {
         Self { iter, last: None }
@@ -165,7 +165,7 @@ where
 impl<I> Iterator for EqualFilter<I>
 where
     I: Iterator,
-    I::Item: EqualKey + PartialEq<I::Item> + Clone,
+    I::Item: KvIteratorItem,
 {
     type Item = I::Item;
 
@@ -174,7 +174,7 @@ where
         loop {
             let a = self.iter.next()?;
             if let Some(last) = &self.last {
-                if last.equal_key(&a) {
+                if last.user_key_slice() == a.user_key_slice() {
                     // item filtered
                     continue;
                 }

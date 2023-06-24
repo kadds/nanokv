@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Config {
     pub path: PathBuf,
     pub no_wal: bool,
@@ -41,20 +41,20 @@ impl Config {
 
 pub type ConfigRef = &'static Config;
 
-pub fn load_config() -> Box<Config> {
+pub fn load_config() -> Config {
     load_config_from("config.toml")
 }
 
-pub fn current_config() -> Box<Config> {
+pub fn current_config() -> Config {
     let cfg = Config {
         path: "nanokv_data/".into(),
         no_wal: false,
         ..Default::default()
     };
-    cfg.into()
+    cfg
 }
 
-pub fn load_config_from(file: &str) -> Box<Config> {
+pub fn load_config_from(file: &str) -> Config {
     let mut buf = String::new();
     File::open(file)
         .and_then(|mut f| f.read_to_string(&mut buf))
@@ -63,12 +63,12 @@ pub fn load_config_from(file: &str) -> Box<Config> {
     toml::from_str(&buf).unwrap()
 }
 
-pub fn test_config() -> Box<Config> {
+pub fn test_config() -> Config {
     let path = std::env::temp_dir();
     let cfg = Config {
         path,
         no_wal: true,
         ..Default::default()
     };
-    cfg.into()
+    cfg
 }

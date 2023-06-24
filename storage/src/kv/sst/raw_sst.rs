@@ -1,18 +1,17 @@
 use byteorder::{ByteOrder, WriteBytesExt};
-use bytes::{Buf, Bytes};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use integer_encoding::{VarIntReader, VarIntWriter};
 use log::debug;
 
-use crate::iterator::{EqualFilter, ScanIter};
+use crate::err::*;
+use crate::iterator::{EqualFilter, KvIteratorItem, ScanIter};
+use crate::key::{InternalKey, Value};
 use crate::kv::superversion::Lifetime;
-use crate::kv::{kv_entry_to_value, KvEntry};
-use crate::value::Value;
 use crate::KvIterator;
 use byteorder::LE;
 use std::fs::File;
-use std::io::{self, BufWriter, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use super::{FileMetaData, SSTReader, SSTWriter};
@@ -27,7 +26,7 @@ struct RawSSTIter<'a> {
 }
 
 impl<'a> Iterator for RawSSTIter<'a> {
-    type Item = KvEntry;
+    type Item = (InternalKey, Value);
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.idx >= self.end {
@@ -35,8 +34,15 @@ impl<'a> Iterator for RawSSTIter<'a> {
         }
         let idx = self.idx;
         self.idx += 1;
-        let val = self.reader.index(idx)?;
-        Some(val.into())
+        let res = match self.reader.index(idx) {
+            Ok(v) => v.into(),
+            Err(e) => {
+                log::error!("error {:?} in iterator", e);
+                return None;
+            }
+        };
+
+        Some(res)
     }
 }
 
@@ -47,13 +53,23 @@ impl<'a> DoubleEndedIterator for RawSSTIter<'a> {
         }
         let idx = self.idx;
         self.idx -= 1;
-        Some(self.reader.index(idx)?.into())
+        let res = match self.reader.index(idx) {
+            Ok(v) => v.into(),
+            Err(e) => {
+                log::error!("error {:?} in iterator", e);
+                return None;
+            }
+        };
+
+        Some(res)
     }
 }
 
 impl<'a> KvIterator for RawSSTIter<'a> {
     fn prefetch(&mut self, _n: usize) {}
 }
+
+pub struct RawSSTReaderFactory {}
 
 #[allow(unused)]
 struct RawSSTReaderInner {
@@ -85,7 +101,7 @@ impl RawSSTReader {
 
         Ok(Self {
             inner: RawSSTReaderInner {
-                seq: meta.seq,
+                seq: meta.number,
                 mmap,
                 file,
                 meta,
@@ -99,9 +115,9 @@ impl RawSSTReader {
         self.inner.meta.clone()
     }
 
-    pub fn get_index(&self, index: u64) -> Option<(Bytes, Value)> {
+    pub fn get_index(&self, index: u64) -> Result<(InternalKey, Value)> {
         let entry = self.inner.index(index)?;
-        Some(kv_entry_to_value(entry.into()))
+        Ok(entry.into())
     }
 }
 
@@ -151,18 +167,20 @@ impl RawSSTReaderInner {
     }
 
     #[allow(unused)]
-    fn offset(&self, offset: u64) -> RawSSTEntry {
+    fn offset(&self, offset: u64) -> Result<RawSSTEntry> {
         let slice = self.mmap.get(0..self.size as usize).unwrap();
-        RawSSTEntry::read(&slice[offset as usize..])
+        let slice = &slice[offset as usize..];
+        RawSSTEntry::read(slice.reader())
     }
 
-    fn index(&self, index: u64) -> Option<RawSSTEntry> {
+    fn index(&self, index: u64) -> Result<RawSSTEntry> {
         let slice = self.mmap.get(0..self.size as usize).unwrap();
         if index >= self.meta.total_keys {
-            return None;
+            return Err(StorageError::Unknown);
         }
         let offset = LE::read_u64(&slice[(self.meta.index_offset + index * 8) as usize..]);
-        Some(RawSSTEntry::read(&slice[offset as usize..]))
+        let slice = &slice[offset as usize..];
+        RawSSTEntry::read(slice.reader())
     }
 
     #[allow(unused)]
@@ -184,17 +202,17 @@ impl SSTReader for RawSSTReader {
         opt: &crate::GetOption,
         key: Bytes,
         _lifetime: &Lifetime<'a>,
-    ) -> Option<Value> {
-        let ver = opt.snapshot().map(|v| v.version()).unwrap_or(u64::MAX);
+    ) -> Result<(InternalKey, Value)> {
+        let ver = opt.snapshot().map(|v| v.sequence()).unwrap_or(u64::MAX);
         let mut index = self.inner.lower_bound(&key);
         loop {
-            let entry = match self.inner.index(index) {
-                Some(e) => e,
-                None => break,
+            let (internal_key, value) = match self.inner.index(index) {
+                Ok(e) => e.into(),
+                Err(e) => return Err(e),
             };
-            if entry.key_bytes == key {
-                if entry.version <= ver {
-                    return Some(Value::from_entry(&entry.into()));
+            if internal_key.user_key() == key {
+                if internal_key.seq() <= ver {
+                    return Ok((internal_key, value));
                 }
             } else {
                 break;
@@ -202,7 +220,7 @@ impl SSTReader for RawSSTReader {
 
             index += 1;
         }
-        None
+        Err(StorageError::KeyNotExist)
     }
 
     fn scan<'a>(
@@ -211,7 +229,7 @@ impl SSTReader for RawSSTReader {
         beg: std::ops::Bound<bytes::Bytes>,
         end: std::ops::Bound<bytes::Bytes>,
         _mark: &Lifetime<'a>,
-    ) -> ScanIter<'a, (bytes::Bytes, crate::Value)> {
+    ) -> ScanIter<'a, (InternalKey, Value)> {
         let beg = match beg {
             std::ops::Bound::Included(val) => self.inner.lower_bound(&val),
             std::ops::Bound::Excluded(val) => self.inner.upper_bound(&val),
@@ -235,15 +253,15 @@ impl SSTReader for RawSSTReader {
         };
 
         if let Some(snapshot) = opt.snapshot() {
-            let snapshot_ver = snapshot.version();
-            let iter = iter.filter(move |entry| entry.version() <= snapshot_ver);
-            ScanIter::new(EqualFilter::new(iter).map(kv_entry_to_value))
+            let snapshot_ver = snapshot.sequence();
+            let iter = iter.filter(move |entry| entry.seq() <= snapshot_ver);
+            ScanIter::new(EqualFilter::new(iter))
         } else {
-            ScanIter::new(EqualFilter::new(iter).map(kv_entry_to_value))
+            ScanIter::new(EqualFilter::new(iter))
         }
     }
 
-    fn raw_scan<'a>(&self, _lifetime: &Lifetime<'a>) -> ScanIter<'a, KvEntry> {
+    fn raw_scan<'a>(&self, _lifetime: &Lifetime<'a>) -> ScanIter<'a, (InternalKey, Value)> {
         let beg = 0;
         let end = self.inner.meta.total_keys;
         let reader = unsafe {
@@ -266,65 +284,43 @@ impl SSTReader for RawSSTReader {
 
 #[allow(unused)]
 struct RawSSTEntry {
-    flags: u64,
-    version: u64,
-    key_len: u32,
-    key_bytes: Bytes,
-    value_len: u32,
-    value_bytes: Bytes,
+    key: InternalKey,
+    value: Bytes,
+}
+
+impl Into<(InternalKey, Value)> for RawSSTEntry {
+    fn into(self) -> (InternalKey, Value) {
+        (self.key.into(), self.value.into())
+    }
 }
 
 impl RawSSTEntry {
-    fn write<W: Write>(entry: &KvEntry, mut w: W) -> usize {
-        let mut total = 0;
-        let buf = entry.flags().to_le_bytes();
-        total += buf.len();
-        w.write_all(&buf).unwrap();
-
-        let buf = entry.version().to_le_bytes();
-        total += buf.len();
-        w.write_all(&buf).unwrap();
-
-        // key
-        let buf = (entry.key().len() as u32).to_le_bytes();
-        total += buf.len();
-        w.write_all(&buf).unwrap();
-        total += entry.key.len();
-        w.write_all(&entry.key()).unwrap();
-
-        // value
-        let buf = (entry.value().len() as u32).to_le_bytes();
-        total += buf.len();
-        w.write_all(&buf).unwrap();
-        total += entry.value.len();
-        w.write_all(&entry.value()).unwrap();
-
-        total
+    fn write<W: Write>(key: &InternalKey, value: &Value, mut w: W) {
+        w.write_varint(key.data().len());
+        w.write_varint(value.data().len());
+        w.write_all(key.data()).unwrap();
+        w.write_all(value.data());
     }
 
-    fn read(buf: &[u8]) -> Self {
-        let mut offset = 0;
-        let flags = LE::read_u64(&buf[offset..]);
-        offset += 8;
-        let version = LE::read_u64(&buf[offset..]);
-        offset += 8;
-        let key_len = LE::read_u32(&buf[offset..]);
-        offset += 4;
+    fn read<R: Read>(mut r: R) -> Result<Self> {
+        // read key length
+        let key_len = r.read_varint::<usize>()?;
+        let value_len = r.read_varint::<usize>()?;
 
-        let key_bytes = Bytes::copy_from_slice(&buf[offset..(offset + key_len as usize)]);
-        offset += key_len as usize;
-        let value_len = LE::read_u32(&buf[offset..]);
-        offset += 4;
-        let value_bytes = Bytes::copy_from_slice(&buf[offset..(offset + value_len as usize)]);
+        let mut key = BytesMut::new();
+        key.resize(key_len, 0);
+        r.read_exact(&mut key)?;
+        let key = key.freeze();
 
-        Self {
-            flags,
-            version,
-            key_len,
-            key_bytes,
-            value_len,
-            value_bytes,
-        }
+        let mut value = BytesMut::new();
+        value.resize(value_len, 0);
+        r.read_exact(&mut value)?;
+        let value = value.freeze();
+
+        Ok(Self {
+            key: key.into(),
+            value,
+        })
     }
 
     fn read_key(buf: &[u8]) -> &str {
@@ -341,20 +337,9 @@ impl RawSSTEntry {
     }
 }
 
-impl From<RawSSTEntry> for KvEntry {
-    fn from(entry: RawSSTEntry) -> Self {
-        Self {
-            key: entry.key_bytes,
-            value: entry.value_bytes,
-            flags: entry.flags,
-            ver: entry.version,
-        }
-    }
-}
-
 #[derive(Debug, Default, Clone)]
 pub struct RawSSTMetaInfo {
-    pub seq: u64,
+    pub number: u64,
     pub level: u32,
     pub total_keys: u64,
     pub index_offset: u64,
@@ -367,7 +352,7 @@ pub struct RawSSTMetaInfo {
 impl RawSSTMetaInfo {
     pub fn write<W: Write>(&mut self, mut w: W) -> io::Result<()> {
         let mut bytes = 0;
-        bytes += w.write_varint(self.seq)?;
+        bytes += w.write_varint(self.number)?;
         bytes += w.write_varint(self.level)?;
         bytes += w.write_varint(self.total_keys)?;
         bytes += w.write_varint(self.index_offset)?;
@@ -407,7 +392,7 @@ impl RawSSTMetaInfo {
         let index_offset: u64 = reader.read_varint()?;
 
         Ok(Self {
-            seq,
+            number: seq,
             total_keys,
             index_offset,
             level,
@@ -444,15 +429,9 @@ impl Drop for RawSSTWriter {
 }
 
 impl SSTWriter for RawSSTWriter {
-    fn write<I>(
-        &mut self,
-        level: u32,
-        seq: u64,
-        iter: I,
-        stop_flag: &AtomicBool,
-    ) -> Option<FileMetaData>
+    fn write<I>(&mut self, level: u32, number: u64, iter: I) -> Result<FileMetaData>
     where
-        I: Iterator<Item = KvEntry>,
+        I: Iterator<Item = (InternalKey, Value)>,
     {
         self.success = false;
         let mut w = BufWriter::new(&mut self.file);
@@ -467,31 +446,24 @@ impl SSTWriter for RawSSTWriter {
 
         let mut cur = 0;
         let mut n = 0;
-        for entry in iter {
+        for (internal_key, value) in iter {
             // write key value entry
             if min_key.is_empty() {
-                min_key = entry.key();
+                min_key = internal_key.user_key();
             }
-            min_ver = min_ver.min(entry.version());
-            max_ver = max_ver.max(entry.version());
+            min_ver = min_ver.min(internal_key.seq());
+            max_ver = max_ver.max(internal_key.seq());
 
-            let bytes = RawSSTEntry::write(&entry, &mut w);
-            last_entry = Some(entry);
+            RawSSTEntry::write(&internal_key, &value, &mut w);
+            last_entry = Some(internal_key);
 
-            keys_offset.push(cur);
-            cur += bytes;
+            keys_offset.push(w.stream_position()?);
             n += 1;
-            if n % 4096 == 0 {
-                if stop_flag.load(Ordering::SeqCst) {
-                    return None;
-                }
-            }
         }
         if let Some(entry) = last_entry {
-            max_key = entry.key();
+            max_key = entry.user_key();
         }
-        let key_offset_begin = w.seek(SeekFrom::Current(0)).unwrap();
-
+        let key_offset_begin = w.stream_position()?;
         // write key offset
 
         let keys = keys_offset.len() as u64;
@@ -503,7 +475,7 @@ impl SSTWriter for RawSSTWriter {
         }
 
         let mut meta_info = RawSSTMetaInfo {
-            seq,
+            number,
             total_keys: keys,
             index_offset: key_offset_begin,
             level,
@@ -518,8 +490,8 @@ impl SSTWriter for RawSSTWriter {
         debug!("write raw sst meta info {:?}", meta_info);
         self.success = true;
 
-        Some(FileMetaData::new(
-            seq, min_key, max_key, min_ver, max_ver, keys, level,
+        Ok(FileMetaData::new(
+            number, min_key, max_key, min_ver, max_ver, keys, level,
         ))
     }
 }

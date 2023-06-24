@@ -10,22 +10,21 @@ use threadpool::ThreadPool;
 use crate::{
     iterator::{MergedIter, ScanIter},
     kv::{
-        manifest::{FileMetaData, Manifest, Version, MAX_LEVEL},
+        manifest::{FileMetaData, Version, MAX_LEVEL},
         sst::{self, SSTReader, SSTWriter},
         superversion::{Lifetime, SuperVersion},
     },
     util::fname::{self},
-    ConfigRef,
+    Config,
 };
 
 use super::CompactSerializer;
 
 pub type CompactSSTFiles = Vec<FileMetaData>;
 
-pub struct MajorSerializer {
+pub struct MajorCompactionTaskPool {
     pool: ThreadPool,
-    manifest: Arc<Manifest>,
-    config: ConfigRef,
+    config: Arc<Config>,
     f: Arc<dyn Fn(CompactSSTFiles, Vec<u64>) + Sync + Send + 'static>,
     factor: AtomicU32,
     stop: Arc<AtomicBool>,
@@ -37,12 +36,12 @@ pub struct CompactInfo {
     level_top: u32,
     compact_bottom: Vec<u64>,
     compact_top: Vec<u64>,
+    number: u64,
 }
 
 fn major_compaction(
     info: CompactInfo,
-    config: ConfigRef,
-    manifest: Arc<Manifest>,
+    config: Arc<Config>,
     f: Arc<dyn Fn(CompactSSTFiles, Vec<u64>) + Sync + Send + 'static>,
     stop_flag: Arc<AtomicBool>,
 ) {
@@ -65,7 +64,7 @@ fn major_compaction(
         .iter()
         .chain(info.compact_top.iter())
         .cloned()
-        .map(|seq| sst::raw_sst::RawSSTReader::new(fname::sst_name(config, seq)).unwrap())
+        .map(|seq| sst::raw_sst::RawSSTReader::new(fname::sst_name(&config, seq)).unwrap())
         .collect();
 
     let mut iters = Vec::new();
@@ -74,29 +73,27 @@ fn major_compaction(
     for file_reader in &reader {
         iters.push(file_reader.raw_scan(&lifetime))
     }
-    let new_seq = manifest.allocate_sst_sequence();
 
-    let mut writer = sst::raw_sst::RawSSTWriter::new(fname::sst_name(config, new_seq));
+    let mut writer = sst::raw_sst::RawSSTWriter::new(fname::sst_name(&config, info.number));
 
     let iter = ScanIter::new(MergedIter::new(iters));
 
-    let meta = match writer.write(info.level_top, new_seq, iter, &stop_flag) {
-        Some(v) => v,
-        None => {
+    let meta = match writer.write(info.level_top, info.number, iter) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("major compact fail {:?}", e);
             return;
         }
     };
 
-    info!("major compaction {} done", new_seq);
     additional.push(meta);
 
     f(additional, removal)
 }
 
-impl MajorSerializer {
+impl MajorCompactionTaskPool {
     pub fn new<F: Fn(CompactSSTFiles, Vec<u64>) + Sync + Send + 'static>(
-        config: ConfigRef,
-        manifest: Arc<Manifest>,
+        config: &Config,
         f: F,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -104,8 +101,7 @@ impl MajorSerializer {
                 .num_threads(config.major_compaction_threads as usize)
                 .thread_name("major compaction ".into())
                 .build(),
-            manifest,
-            config,
+            config: Arc::new(config.clone()),
             f: Arc::new(f),
             factor: AtomicU32::new(10),
             stop: AtomicBool::new(false).into(),
@@ -114,16 +110,15 @@ impl MajorSerializer {
 
     fn compact_async(&self, info: CompactInfo) {
         let f = self.f.clone();
-        let config = self.config;
-        let m = self.manifest.clone();
+        let config = self.config.clone();
         let stop_flag = self.stop.clone();
         self.pool
-            .execute(|| major_compaction(info, config, m, f, stop_flag))
+            .execute(|| major_compaction(info, config, f, stop_flag))
     }
 
     pub fn notify(&self, sv: &SuperVersion) {
         let fac = self.factor.load(Ordering::Relaxed);
-        let config = self.config;
+        let config = &self.config;
         if rand::thread_rng().next_u32() % fac == 0 {
             if let Some(info) = pick_compaction_info(config, &sv.sst_version) {
                 self.compact_async(info);
@@ -135,20 +130,20 @@ impl MajorSerializer {
     }
 }
 
-impl Drop for MajorSerializer {
+impl Drop for MajorCompactionTaskPool {
     fn drop(&mut self) {
         self.stop();
     }
 }
 
-impl CompactSerializer for MajorSerializer {
+impl CompactSerializer for MajorCompactionTaskPool {
     fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
         self.pool.join();
     }
 }
 
-fn pick_compaction_info(_config: ConfigRef, version: &Version) -> Option<CompactInfo> {
+fn pick_compaction_info(_config: &Config, version: &Version) -> Option<CompactInfo> {
     // check level 0
     let mut info = CompactInfo::default();
     let mut cancel = false;
@@ -164,14 +159,14 @@ fn pick_compaction_info(_config: ConfigRef, version: &Version) -> Option<Compact
         if num > 4 {
             for fs in version.level_n(0) {
                 if fs.set_picked() {
-                    info.compact_bottom.push(fs.meta().seq);
+                    info.compact_bottom.push(fs.meta().number);
                 }
             }
         }
         // level 1
         for fs in version.level_n(1) {
             if fs.set_picked() {
-                info.compact_top.push(fs.meta().seq);
+                info.compact_top.push(fs.meta().number);
                 break;
             }
         }
@@ -192,7 +187,7 @@ fn pick_compaction_info(_config: ConfigRef, version: &Version) -> Option<Compact
             if num > 1 {
                 for fs in version.level_n(0) {
                     if fs.set_picked() {
-                        info.compact_bottom.push(fs.meta().seq);
+                        info.compact_bottom.push(fs.meta().number);
                     }
                 }
             }
@@ -205,14 +200,14 @@ fn pick_compaction_info(_config: ConfigRef, version: &Version) -> Option<Compact
     if cancel {
         for seq in info.compact_bottom {
             for fs in version.level_n(info.level_bottom) {
-                if fs.meta().seq == seq {
+                if fs.meta().number == seq {
                     fs.set_using();
                 }
             }
         }
         for seq in info.compact_top {
             for fs in version.level_n(info.level_top) {
-                if fs.meta().seq == seq {
+                if fs.meta().number == seq {
                     fs.set_using();
                 }
             }
