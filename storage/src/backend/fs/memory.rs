@@ -90,7 +90,7 @@ impl Drop for WriteableMemoryBasedPersist {
 }
 
 impl PersistBackend for MemoryBasedPersistBackend {
-    fn open(&self, path: PathBuf, enable_mmap: bool) -> Result<Box<dyn ReadablePersist>> {
+    fn open(&self, path: &Path, enable_mmap: bool) -> Result<Box<dyn ReadablePersist>> {
         let files = self.files.lock().unwrap();
         let bytes = files
             .get(path.to_str().unwrap())
@@ -110,7 +110,7 @@ impl PersistBackend for MemoryBasedPersistBackend {
         }
     }
 
-    fn create(&self, path: PathBuf, truncate: Option<u64>) -> Result<Box<dyn WriteablePersist>> {
+    fn create(&self, path: &Path, truncate: Option<u64>) -> Result<Box<dyn WriteablePersist>> {
         Ok(Box::new(WriteableMemoryBasedPersist {
             bytes: Some(BytesMut::new().writer()),
             path: path.to_str().unwrap().to_owned(),
@@ -120,7 +120,7 @@ impl PersistBackend for MemoryBasedPersistBackend {
         }))
     }
 
-    fn remove(&self, path: PathBuf) -> Result<()> {
+    fn remove(&self, path: &Path) -> Result<()> {
         let mut files = self.files.lock().unwrap();
         files.remove(path.to_str().unwrap());
         Ok(())
@@ -133,7 +133,19 @@ impl PersistBackend for MemoryBasedPersistBackend {
         }
     }
 
-    fn make_sure_dir(&self, path: PathBuf) -> Result<()> {
+    fn make_sure_dir(&self, path: &Path) -> Result<()> {
         Ok(())
     }
+
+    fn rename(&self, src: &Path, dst: &Path) -> Result<()> {
+        let mut files = self.files.lock().unwrap();
+        let path_str = src.to_str().unwrap();
+        let content = files.remove(path_str);
+        if let Some(content) = content {
+            files.insert(dst.to_str().unwrap().to_owned(), content);
+        }
+
+        Ok(())
+    }
+
 }

@@ -14,11 +14,10 @@ use threadpool::ThreadPool;
 use crate::{
     kv::{
         manifest::FileMetaData,
-        sst::{self, SSTWriter},
-        Imemtable,
+        sst::{self, SSTWriter}, Memtable,
     },
     util::fname,
-    Config, ConfigRef,
+    Config, ConfigRef, backend::Backend,
 };
 
 use super::CompactSerializer;
@@ -28,23 +27,25 @@ pub struct MinorCompactionTaskPool {
     stop: Arc<AtomicBool>,
 
     config: Arc<Config>,
+    backend: &'static Backend,
 
     f: Arc<dyn Fn(FileMetaData) + Sync + Send + 'static>,
 }
 
 fn minor_compaction(
     config: Arc<Config>,
-    table: Arc<Imemtable>,
+    table: Arc<Memtable>,
+    backend: &'static Backend,
     f: Arc<dyn Fn(FileMetaData) + Sync + Send + 'static>,
 ) {
     info!("do minor compaction {}", table.number());
     let meta = {
         let beg = Instant::now();
         let number = table.number();
-        let iter = table.entry_iter();
-        let mut sst = sst::raw_sst::RawSSTWriter::new(fname::sst_name(&config, table.number()));
+        let iter = table.iter();
+        let mut sst = sst::raw_sst::RawSSTWriter::new(backend, fname::sst_name(&config, table.number()));
 
-        let meta = match sst.write(0, number, iter.map(|v| (v.0, v.1.into()))) {
+        let meta = match sst.write(0, number, iter.map(|v| (v.0.clone(), v.1.clone().into()))) {
             Ok(v) => v,
             Err(e) => {
                 log::warn!("minor compaction fail {:?}", e);
@@ -60,7 +61,7 @@ fn minor_compaction(
 }
 
 impl MinorCompactionTaskPool {
-    pub fn new<F: Fn(FileMetaData) + Send + Sync + 'static>(config: &Config, f: F) -> Arc<Self> {
+    pub fn new<F: Fn(FileMetaData) + Send + Sync + 'static>(config: &Config, backend: &Backend, f: F) -> Arc<Self> {
         Arc::new(Self {
             pool: threadpool::Builder::new()
                 .num_threads(config.minor_compaction_threads as usize)
@@ -68,18 +69,20 @@ impl MinorCompactionTaskPool {
                 .build(),
             config: Arc::new(config.clone()),
             f: Arc::new(f),
+            backend: unsafe {std::mem::transmute(backend)},
             stop: AtomicBool::new(false).into(),
         })
     }
 
-    pub fn compact_async(self: &Arc<Self>, table: Arc<Imemtable>) {
+    pub fn compact_async(self: &Arc<Self>, table: Arc<Memtable>) {
         let this = self.clone();
         let config = this.config.clone();
         let f = this.f.clone();
         let stop_flag = this.stop.clone();
+        let backend = self.backend;
         this.clone()
             .pool
-            .execute(move || minor_compaction(config, table, f));
+            .execute(move || minor_compaction(config, table, backend, f));
     }
 }
 

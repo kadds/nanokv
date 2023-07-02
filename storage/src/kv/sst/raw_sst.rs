@@ -3,6 +3,8 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use integer_encoding::{VarIntReader, VarIntWriter};
 use log::debug;
 
+use crate::backend::Backend;
+use crate::backend::fs::WriteablePersist;
 use crate::err::*;
 use crate::iterator::{EqualFilter, KvIteratorItem, ScanIter};
 use crate::key::{InternalKey, Value};
@@ -295,11 +297,15 @@ impl Into<(InternalKey, Value)> for RawSSTEntry {
 }
 
 impl RawSSTEntry {
-    fn write<W: Write>(key: &InternalKey, value: &Value, mut w: W) {
-        w.write_varint(key.data().len());
-        w.write_varint(value.data().len());
-        w.write_all(key.data()).unwrap();
-        w.write_all(value.data());
+    fn write<W: Write>(key: &InternalKey, value: &Value, mut w: W) -> io::Result<u64> {
+        let mut len = 0usize;
+        len += w.write_varint(key.data().len())?;
+        len += w.write_varint(value.data().len())?;
+        w.write_all(key.data())?;
+        len += key.data().len();
+        w.write_all(value.data())?;
+        len += value.data().len();
+        Ok(len as u64)
     }
 
     fn read<R: Read>(mut r: R) -> Result<Self> {
@@ -404,14 +410,14 @@ impl RawSSTMetaInfo {
 }
 
 pub struct RawSSTWriter {
-    file: File,
+    file: Box<dyn WriteablePersist>,
     name: PathBuf,
     success: bool,
 }
 
 impl RawSSTWriter {
-    pub fn new(name: PathBuf) -> Self {
-        let file = File::create(&name).unwrap();
+    pub fn new(backend: &Backend, name: PathBuf) -> Self {
+        let file = backend.fs.create(&name, None).unwrap();
         Self {
             file,
             name,
@@ -454,16 +460,16 @@ impl SSTWriter for RawSSTWriter {
             min_ver = min_ver.min(internal_key.seq());
             max_ver = max_ver.max(internal_key.seq());
 
-            RawSSTEntry::write(&internal_key, &value, &mut w);
+            cur += RawSSTEntry::write(&internal_key, &value, &mut w)?;
             last_entry = Some(internal_key);
 
-            keys_offset.push(w.stream_position()?);
+            keys_offset.push(cur);
             n += 1;
         }
         if let Some(entry) = last_entry {
             max_key = entry.user_key();
         }
-        let key_offset_begin = w.stream_position()?;
+        let key_offset_begin = cur;
         // write key offset
 
         let keys = keys_offset.len() as u64;

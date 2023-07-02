@@ -18,7 +18,7 @@ use crate::{
     compaction::{major::MajorCompactionTaskPool, minor::MinorCompactionTaskPool},
     err::{Result, StorageError},
     iterator::{KvIteratorItem, MergedIter, ScanIter},
-    key::{KeyType, Value, WriteBatch, WriteBatchBuilder, WriteBatchLogSerializer},
+    key::{KeyType, Value, WriteBatch, WriteBatchBuilder, BatchLogSerializer},
     kv::{
         manifest::VersionEdit, sst::SnapshotTable, superversion::SuperVersion, ColumnFamilyTables,
         Imemtables,
@@ -30,7 +30,7 @@ use crate::{
 };
 use crate::{
     compaction::CompactSerializer,
-    kv::{manifest::Manifest, Imemtable, Memtable},
+    kv::{manifest::Manifest, Memtable},
     log::LogWriter,
 };
 
@@ -43,7 +43,7 @@ struct StorageInfoInner {
     manifest: Manifest<'this>,
     #[borrows(config, backend)]
     #[not_covariant]
-    wal: Option<LogWriter<'this, WriteBatchLogSerializer>>,
+    wal: Option<LogWriter<'this, BatchLogSerializer>>,
 }
 
 struct StorageInner {
@@ -79,31 +79,47 @@ impl StorageInner {
         self.tables.store(sv.cf_tables.clone());
         self.super_version.store(Arc::new(sv));
     }
+
+    pub fn modify_super_version_opt<F: FnOnce(&SuperVersion) -> Option<SuperVersion>>(&self, f: F) {
+        let _lock = self.lock.lock().unwrap();
+        let sv = self.super_version.load();
+        let val = self.step_version.fetch_add(1, Ordering::SeqCst);
+        let sv = match f(sv.as_ref()) {
+            Some(v) => v,
+            None => {
+                return;
+            }
+        };
+        assert!(val + 1 == sv.step_version);
+
+        self.tables.store(sv.cf_tables.clone());
+        self.super_version.store(Arc::new(sv));
+    }
 }
 
 pub struct Storage {
     inner: Arc<StorageInner>,
 
-    serializer: Arc<MinorCompactionTaskPool>,
-    major_serializer: Arc<MajorCompactionTaskPool>,
+    minor_pool: Arc<MinorCompactionTaskPool>,
+    major_pool: Arc<MajorCompactionTaskPool>,
 }
 
 impl Storage {
     pub fn clear(config: Config) {}
 
     pub fn new(config: Config, backend: Backend) -> Self {
-        backend.fs.make_sure_dir(config.path.to_path_buf()).unwrap();
+        backend.fs.make_sure_dir(&config.path.to_path_buf()).unwrap();
         backend
             .fs
-            .make_sure_dir(sst_name(&config, 0).parent().unwrap().to_path_buf())
+            .make_sure_dir(&sst_name(&config, 0).parent().unwrap().to_path_buf())
             .unwrap();
         backend
             .fs
-            .make_sure_dir(manifest_name(&config, 0).parent().unwrap().to_path_buf())
+            .make_sure_dir(&manifest_name(&config, 0).parent().unwrap().to_path_buf())
             .unwrap();
         backend
             .fs
-            .make_sure_dir(wal_name(&config, 0).parent().unwrap().to_path_buf())
+            .make_sure_dir(&wal_name(&config, 0).parent().unwrap().to_path_buf())
             .unwrap();
         // prepare dir
         // fname::make_sure(conf);
@@ -119,7 +135,7 @@ impl Storage {
                 if c.no_wal {
                     None
                 } else {
-                    Some(LogWriter::new(&b, WriteBatchLogSerializer))
+                    Some(LogWriter::new(&b, BatchLogSerializer))
                 }
             },
         );
@@ -155,7 +171,8 @@ impl Storage {
         // init compaction thread pool
 
         let inner2 = inner.clone();
-        let serializer = MinorCompactionTaskPool::new(&config, move |meta| {
+        let backend = unsafe { std::mem::transmute(inner.info.borrow_backend())};
+        let minor_pool = MinorCompactionTaskPool::new(&config, backend, move |meta| {
             inner2.info.with_manifest(|m| {
                 let number = meta.number;
                 m.add_sst_with(meta, true, |current| {
@@ -172,7 +189,7 @@ impl Storage {
         });
 
         let inner2 = inner.clone();
-        let major_serializer = MajorCompactionTaskPool::new(&config, move |additional, removal| {
+        let major_pool = MajorCompactionTaskPool::new(&config, backend, move |additional, removal| {
             let mut vec = Vec::new();
             for meta in additional {
                 vec.push(VersionEdit::SSTAppended(meta));
@@ -193,8 +210,8 @@ impl Storage {
 
         let mut this = Self {
             inner,
-            serializer,
-            major_serializer,
+            minor_pool,
+            major_pool,
         };
         if need_restore {
             this.restore();
@@ -231,6 +248,7 @@ impl Storage {
             }
             Err(e) => {
                 if StorageError::KeyNotExist == e {
+                } else {
                     return Err(e);
                 }
             }
@@ -253,6 +271,7 @@ impl Storage {
             }
             Err(e) => {
                 if StorageError::KeyNotExist == e {
+                } else {
                     return Err(e);
                 }
             }
@@ -363,7 +382,7 @@ impl Storage {
         if tables.memtable.full() {
             self.flush_memtable();
         }
-        self.major_serializer.notify(&inner.super_version());
+        self.major_pool.notify(&inner.super_version());
         Ok(cur_ver)
     }
 
@@ -376,7 +395,7 @@ impl Storage {
     fn restore(&mut self) {
         let config = self.inner.info.borrow_config();
         let tables = self.inner.tables.load();
-        let replayer = LogReplayer::new(self.inner.info.borrow_backend(), WriteBatchLogSerializer);
+        let replayer = LogReplayer::new(self.inner.info.borrow_backend(), BatchLogSerializer);
         let iter = match replayer.iter(wal_name(config, tables.memtable.number())) {
             Ok(e) => e,
             Err(e) => {
@@ -399,28 +418,26 @@ impl Storage {
     /// flush memtable into imemtable
     pub(crate) fn flush_memtable(&self) {
         let inner = self.inner.as_ref();
-        let tables = inner.tables.load();
-        // if !tables.memtable.is_empty() {
-        //     let new_seq = inner.manifest.allocate_sst_sequence();
+        inner.modify_super_version_opt(move |sv: &SuperVersion| {
+            let old_table = sv.cf_tables.memtable.clone();
+            if !old_table.is_empty() {
+                let new_number = inner.info.with_manifest(|m| m.allocate_sst_number());
+                let memtable = Arc::new(Memtable::new(new_number));
+                let current = sv.sst_version.clone();
+                self.minor_pool.compact_async(old_table.clone());
 
-        //     let imemtable = Arc::new(Imemtable::new(tables.memtable));
-        //     let target = imemtable.clone();
-        //     let cf_tables = Arc::new(ColumnFamilyTables {
-        //         memtable: Arc::new(Memtable::new()),
-        //         imemtables: tables.imemtables.push(imemtable),
-        //     });
-        //     let t = cf_tables;
-
-        //     inner.modify_super_version(move |sv| SuperVersion {
-        //         cf_tables: t,
-        //         sst_version: sv.sst_version.clone(),
-        //         step_version: sv.step_version + 1,
-        //     });
-
-        //     drop(tables);
-
-        //     self.serializer.compact_async(target);
-        // }
+                Some(SuperVersion {
+                    cf_tables: Arc::new(ColumnFamilyTables {
+                        memtable,
+                        imemtables: sv.cf_tables.imemtables.push(old_table),
+                    }),
+                    sst_version: current,
+                    step_version: sv.step_version + 1,
+                })
+            } else {
+                None
+            }
+        });
     }
 
     pub(crate) fn flush_wait_imemtables(&mut self) {
@@ -440,7 +457,7 @@ impl Storage {
         self.flush_memtable();
         self.flush_wait_imemtables();
 
-        self.serializer.stop();
+        self.minor_pool.stop();
         self.inner.info.with_manifest(|m| m.flush());
     }
 }

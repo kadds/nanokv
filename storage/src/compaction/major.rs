@@ -15,7 +15,7 @@ use crate::{
         superversion::{Lifetime, SuperVersion},
     },
     util::fname::{self},
-    Config,
+    Config, backend::Backend,
 };
 
 use super::CompactSerializer;
@@ -27,6 +27,7 @@ pub struct MajorCompactionTaskPool {
     config: Arc<Config>,
     f: Arc<dyn Fn(CompactSSTFiles, Vec<u64>) + Sync + Send + 'static>,
     factor: AtomicU32,
+    backend: &'static Backend,
     stop: Arc<AtomicBool>,
 }
 
@@ -43,6 +44,7 @@ fn major_compaction(
     info: CompactInfo,
     config: Arc<Config>,
     f: Arc<dyn Fn(CompactSSTFiles, Vec<u64>) + Sync + Send + 'static>,
+    backend: &'static Backend,
     stop_flag: Arc<AtomicBool>,
 ) {
     if stop_flag.load(Ordering::SeqCst) {
@@ -74,7 +76,7 @@ fn major_compaction(
         iters.push(file_reader.raw_scan(&lifetime))
     }
 
-    let mut writer = sst::raw_sst::RawSSTWriter::new(fname::sst_name(&config, info.number));
+    let mut writer = sst::raw_sst::RawSSTWriter::new(backend, fname::sst_name(&config, info.number));
 
     let iter = ScanIter::new(MergedIter::new(iters));
 
@@ -94,6 +96,7 @@ fn major_compaction(
 impl MajorCompactionTaskPool {
     pub fn new<F: Fn(CompactSSTFiles, Vec<u64>) + Sync + Send + 'static>(
         config: &Config,
+        backend: &Backend,
         f: F,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -104,6 +107,7 @@ impl MajorCompactionTaskPool {
             config: Arc::new(config.clone()),
             f: Arc::new(f),
             factor: AtomicU32::new(10),
+            backend: unsafe {std::mem::transmute(backend)},
             stop: AtomicBool::new(false).into(),
         })
     }
@@ -112,8 +116,9 @@ impl MajorCompactionTaskPool {
         let f = self.f.clone();
         let config = self.config.clone();
         let stop_flag = self.stop.clone();
+        let backend = self.backend;
         self.pool
-            .execute(|| major_compaction(info, config, f, stop_flag))
+            .execute(|| major_compaction(info, config, f, backend, stop_flag))
     }
 
     pub fn notify(&self, sv: &SuperVersion) {

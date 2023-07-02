@@ -16,10 +16,9 @@ use crate::{
     ConfigRef,
 };
 
-use super::{LogEntrySerializer, LogSegmentFlags, SEGMENT_SIZE};
+use super::{LogEntrySerializer, LogSegmentFlags, SEGMENT_SIZE, replayer::SegmentRead};
 
 const DEFAULT_ALLOC_SIZE: u64 = 1024 * 1024 * 5; // 5MB
-const DELTA_ALLOC_SIZE: u64 = 1024 * 1024 * 5; // 5MB
 
 pub trait SegmentWrite: Write {
     fn flush_all(self) -> io::Result<u64>;
@@ -201,7 +200,7 @@ where
     pub fn sync(&self) -> Result<()> {
         let mut inner = self.inner.lock().unwrap();
         if let Some((cur, _)) = inner.current.as_mut() {
-            cur.sync();
+            cur.sync()?;
         }
         Ok(())
     }
@@ -212,19 +211,53 @@ where
     {
         let mut inner = self.inner.lock().unwrap();
         if let Some((mut cur, _)) = inner.current.take() {
-            cur.sync();
+            cur.sync()?;
         } else {
         }
+        let path = path.into();
 
         let mut write_buffer = vec![];
         write_buffer.resize(SEGMENT_SIZE, 0);
         let file = self
             .backend
             .fs
-            .create(path.into(), Some(DEFAULT_ALLOC_SIZE))?;
+            .create(&path, Some(DEFAULT_ALLOC_SIZE))?;
         inner.current = Some((file, write_buffer));
         inner.write_bytes = 0;
 
         Ok(())
+    }
+}
+
+pub struct DummySegmentWrite<W> {
+    w: W,
+    len: usize,
+}
+
+impl<W> DummySegmentWrite<W> where W: Write {
+    pub fn new(w: W) -> Self {
+        Self {
+            w,
+            len: 0,
+        }
+    }
+}
+
+impl<W> Write for DummySegmentWrite<W> where W:Write{
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let r = self.w.write(buf)?;
+        self.len += r;
+        Ok(r)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.w.flush()
+    }
+}
+
+impl<W> SegmentWrite for DummySegmentWrite<W> where W:Write {
+    fn flush_all(self) -> io::Result<u64> {
+        let r = self.len as u64;
+        Ok(r)
     }
 }

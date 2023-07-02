@@ -74,6 +74,10 @@ impl LookupKeyValue {
         let len = self.bytes.clone().reader().read_u32::<LE>().unwrap() + 4;
         self.bytes.slice(len as usize..)
     }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
 }
 
 impl PartialEq for LookupKeyValue {
@@ -224,15 +228,13 @@ fn map_bound<T>(b: &Bound<T>) -> Bound<&T> {
 impl Memtable {
     pub fn set<B: AsRef<[u8]>>(&self, key: InternalKey, value: B) -> Result<()> {
         let value = value.as_ref();
-        let value_len = value.len();
         if self.list.is_empty() {
             self.min_seq
                 .store(key.seq(), std::sync::atomic::Ordering::Release);
         }
         let kv = LookupKeyValue::new(key, value);
-
         self.total_bytes
-            .fetch_add(value_len as u64, std::sync::atomic::Ordering::AcqRel);
+            .fetch_add(kv.len() as u64, std::sync::atomic::Ordering::AcqRel);
         let l = &self.list as *const skiplist::OrderedSkipList<LookupKeyValue>;
         unsafe {
             let l = (l as *mut skiplist::OrderedSkipList<LookupKeyValue>)
@@ -245,6 +247,24 @@ impl Memtable {
     }
 
     pub fn set_batch(&self, b: WriteBatch) -> Result<()> {
+        if self.list.is_empty() {
+            self.min_seq
+                .store(b.seq(), std::sync::atomic::Ordering::Release);
+        }
+
+        let l = &self.list as *const skiplist::OrderedSkipList<LookupKeyValue>;
+        for (key, value) in b.iter() {
+            let kv = LookupKeyValue::new(key, &value);
+            self.total_bytes
+                .fetch_add(kv.len() as u64, std::sync::atomic::Ordering::AcqRel);
+
+            unsafe {
+                let l = (l as *mut skiplist::OrderedSkipList<LookupKeyValue>)
+                    .as_mut()
+                    .unwrap();
+                l.insert(kv);
+            }
+        }
         Ok(())
     }
 }
@@ -335,5 +355,15 @@ mod test {
 
         let lifetime = Lifetime::default();
         assert!(table.get(&opt, "0".into(), &lifetime).is_ok());
+    }
+
+    #[test]
+    pub fn lookup_key() {
+        let key = InternalKey::new("123", 456, KeyType::Del);
+        let value = "abc";
+        let key = LookupKeyValue::new(key, value.as_bytes());
+        assert_eq!(key.user_key(), "123");
+        assert_eq!(key.seq(), 456);
+        assert_eq!(key.value(), value);
     }
 }

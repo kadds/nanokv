@@ -82,6 +82,8 @@ impl<'a> SnapshotTable<'a> {
                     Ok(val) => return Ok(val),
                     Err(e) => {
                         if StorageError::KeyNotExist == e {
+                            continue
+                        } else {
                             return Err(e);
                         }
                     }

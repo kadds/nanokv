@@ -2,8 +2,6 @@ use std::{collections::BinaryHeap, marker::PhantomData};
 
 use bytes::Bytes;
 
-use crate::key::InternalKey;
-
 pub trait KvIterator: Iterator {
     fn prefetch(&mut self, n: usize);
 }

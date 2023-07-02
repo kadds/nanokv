@@ -3,7 +3,7 @@ use std::{
     fs::File,
     io::{Read, Seek, Write},
     ops::Range,
-    path::PathBuf,
+    path::Path,
 };
 
 use crate::err::Result;
@@ -29,12 +29,13 @@ pub struct PersistFeature {
 }
 
 pub trait PersistBackend: Send + Sync + Debug {
-    fn open(&self, path: PathBuf, enable_mmap: bool) -> Result<Box<dyn ReadablePersist>>;
+    fn open(&self, path: &Path, enable_mmap: bool) -> Result<Box<dyn ReadablePersist>>;
     fn get_feature(&self) -> PersistFeature;
-    fn create(&self, path: PathBuf, truncate: Option<u64>) -> Result<Box<dyn WriteablePersist>>;
-    fn remove(&self, path: PathBuf) -> Result<()>;
+    fn create(&self, path: &Path, truncate: Option<u64>) -> Result<Box<dyn WriteablePersist>>;
+    fn remove(&self, path: &Path) -> Result<()>;
     fn usage_total(&self) -> UsageTotal;
-    fn make_sure_dir(&self, path: PathBuf) -> Result<()>;
+    fn make_sure_dir(&self, path: &Path) -> Result<()>;
+    fn rename(&self, src: &Path, dst: &Path) -> Result<()>;
 }
 
 pub mod local;

@@ -3,7 +3,7 @@ use std::{
     io::{self, BufReader, Read},
     marker::PhantomData,
     path::PathBuf,
-    sync::Arc,
+    sync::Arc, fmt::Write,
 };
 
 use byteorder::{ReadBytesExt, LE};
@@ -195,7 +195,8 @@ where
     where
         P: Into<PathBuf>,
     {
-        let underlying = self.backend.fs.open(path.into(), false)?;
+        let path = path.into();
+        let underlying = self.backend.fs.open(&path, false)?;
         let mut cache = vec![];
         cache.resize(SEGMENT_SIZE, 0);
         Ok(LogReplayerIter {
@@ -205,4 +206,21 @@ where
             _pd: PhantomData::default(),
         })
     }
+}
+
+pub struct DummySegmentRead<R>(R) where R: Read;
+
+impl<R> DummySegmentRead<R> where R: Read {
+    pub fn new(r: R) -> Self {
+        Self(r)
+    }
+}
+
+impl<R> Read for DummySegmentRead<R> where R: Read {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl<R> SegmentRead  for DummySegmentRead<R> where R: Read {
 }

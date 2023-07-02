@@ -3,7 +3,6 @@ use std::io::{self, Write};
 use byteorder::{ReadBytesExt, WriteBytesExt, LE};
 use bytes::{buf::Writer, Buf, BufMut, Bytes, BytesMut};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
-
 use crate::{
     err::{Result, StorageError},
     iterator::KvIteratorItem,
@@ -11,7 +10,7 @@ use crate::{
     WriteOption,
 };
 
-#[derive(IntoPrimitive, TryFromPrimitive, Eq, PartialEq)]
+#[derive(IntoPrimitive, TryFromPrimitive, Eq, PartialEq, Debug)]
 #[repr(u8)]
 pub enum KeyType {
     Set = 0,
@@ -71,6 +70,10 @@ impl InternalKey {
     pub fn data(&self) -> &[u8] {
         &self.bytes
     }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
 }
 
 impl KvIteratorItem for InternalKey {
@@ -120,13 +123,15 @@ pub struct WriteBatch {
     bytes: Bytes,
     option: WriteOption,
     total: u32,
+    seq: u64,
 }
 
 impl WriteBatch {
     pub fn iter(&self) -> BatchIter {
+        let mut r = self.bytes.clone().reader();
         BatchIter {
             inner: self,
-            offset: 0,
+            offset: 16,
         }
     }
 
@@ -136,6 +141,10 @@ impl WriteBatch {
 
     pub fn data(&self) -> &Bytes {
         &self.bytes
+    }
+
+    pub fn seq(&self) -> u64 {
+        self.seq
     }
 
     pub fn count(&self) -> usize {
@@ -160,8 +169,8 @@ impl WriteBatchBuilder {
     pub fn new(option: WriteOption) -> Self {
         let mut bytes = BytesMut::with_capacity(128).writer();
         // skip 16 bytes
-        bytes.write_u64::<LE>(0);
-        bytes.write_u64::<LE>(0);
+        let _ = bytes.write_u64::<LE>(0);
+        let _ = bytes.write_u64::<LE>(0);
 
         Self {
             option,
@@ -179,12 +188,12 @@ impl WriteBatchBuilder {
             return Err(StorageError::ValueTooLarge);
         }
 
-        let total_length = key.data().len() + value.len();
+        let total_length = key.len() + value.len();
 
-        self.bytes.write_u32::<LE>(total_length as u32);
-        self.bytes.write_u32::<LE>(key.data().len() as u32);
-        self.bytes.write(key.data());
-        self.bytes.write(value);
+        let _ = self.bytes.write_u32::<LE>(total_length as u32);
+        let _ = self.bytes.write_u32::<LE>(key.len() as u32);
+        let _ = self.bytes.write_all(key.data());
+        let _ = self.bytes.write_all(value);
 
         self.total += 1;
         Ok(())
@@ -205,14 +214,22 @@ impl WriteBatchBuilder {
     }
 
     pub fn build(self) -> WriteBatch {
-        let b = self.bytes.into_inner();
-        b.clone().writer().write_u64::<LE>(self.total as u64);
-        b.clone().writer().write_u64::<LE>(self.seq);
+        let mut b = self.bytes.into_inner();
+
+        let mut data: [u8; 8] = [0; 8];
+        let mut w = data.writer();
+        let _ = w.write_u64::<LE>(self.total as u64);
+        let _ = w.write_u64::<LE>(self.seq);
+        let _ = w.flush();
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_mut_ptr(), b.as_mut().as_mut_ptr(), 8);
+        }
 
         WriteBatch {
             bytes: b.freeze(),
             option: self.option,
             total: self.total,
+            seq: self.seq,
         }
     }
 }
@@ -226,11 +243,11 @@ impl<'a> Iterator for BatchIter<'a> {
     type Item = (InternalKey, Bytes);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut reader = self.inner.bytes.slice(self.offset..).clone().reader();
-        let offset = self.offset + 8;
+        let mut reader = self.inner.bytes.slice(self.offset..).reader();
         let length = reader.read_u32::<LE>().ok()? as usize;
         let internal_key_length = reader.read_u32::<LE>().ok()? as usize;
-        self.offset += length;
+        let offset = self.offset + 8; // total_length+key_length
+        self.offset += length + 8;
         Some((
             self.inner
                 .bytes
@@ -264,9 +281,9 @@ impl From<Bytes> for Value {
 }
 
 #[derive(Debug, Default)]
-pub struct WriteBatchLogSerializer;
+pub struct BatchLogSerializer;
 
-impl LogEntrySerializer for WriteBatchLogSerializer {
+impl LogEntrySerializer for BatchLogSerializer {
     type Entry = WriteBatch;
 
     fn write<W>(&self, entry: &Self::Entry, w: &mut W) -> io::Result<()>
@@ -286,22 +303,83 @@ impl LogEntrySerializer for WriteBatchLogSerializer {
         let count = r.read_u64::<LE>()?;
         let seq = r.read_u64::<LE>()?;
 
-        for index in 0..count {
+        for _ in 0..count {
             // read length
             let length = r.read_u32::<LE>()?;
+            let key_length = r.read_u32::<LE>()? as usize;
+
             let mut full_key_value = BytesMut::new();
             full_key_value.resize(length as usize, 0);
             r.read_exact(&mut full_key_value)?;
-            let full_key_value = full_key_value.freeze();
-            let mut r = full_key_value.clone().reader();
 
-            let key_length = r.read_u32::<LE>()? as usize;
+            let full_key_value = full_key_value.freeze();
             let key = full_key_value.slice(..key_length);
             let value = full_key_value.slice(key_length..);
 
-            builder.add_internal(key.into(), value);
+            builder.add_internal(key.into(), value).unwrap();
         }
+        builder.set_seq(seq);
 
         Ok(builder.build())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::log::{wal::{DummySegmentWrite}, replayer::DummySegmentRead};
+
+    use super::*;
+
+    #[test]
+    pub fn log_serializer() {
+        let mut batch_builder = WriteBatchBuilder::default();
+        batch_builder.set("123", "abc").unwrap();
+        batch_builder.del("456").unwrap();
+        batch_builder.set("1", "a").unwrap();
+        let batch = batch_builder.build();
+        let mut buf = BytesMut::default().writer();
+        let mut w = DummySegmentWrite::new(&mut buf);
+
+        BatchLogSerializer::default().write(&batch, &mut w).unwrap();
+        let buf = buf.into_inner().freeze();
+        let mut r = DummySegmentRead::new(buf.reader());
+        let batch2 = BatchLogSerializer::default().read(&mut r).unwrap();
+
+        assert_eq!(batch.count(), batch2.count());
+        assert_eq!(batch.data(), batch2.data());
+    }
+
+    #[test]
+    pub fn internal_key() {
+        let key = InternalKey::new("123", 456, KeyType::Del);
+        assert_eq!(key.user_key_slice(), "123".as_bytes());
+        assert_eq!(key.seq(), 456);
+        assert_eq!(key.key_type(), KeyType::Del);
+    }
+
+    #[test]
+    pub fn batch_key() {
+        let mut batch_builder = WriteBatchBuilder::default();
+        batch_builder.set("123", "abc").unwrap();
+        batch_builder.del("456").unwrap();
+        batch_builder.set("1", "a").unwrap();
+        let batch = batch_builder.build();
+
+        assert_eq!(batch.data().len(), 75);
+
+        let mut iter = batch.iter();
+        let (k, v) = iter.next().unwrap();
+        assert_eq!(k.user_key_slice(), "123".as_bytes());
+        assert_eq!(v, "abc");
+
+        let (k, v) = iter.next().unwrap();
+        assert_eq!(k.user_key_slice(), "456".as_bytes());
+        assert_eq!(v, "");
+
+        let (k, v) = iter.next().unwrap();
+        assert_eq!(k.user_key_slice(), "1".as_bytes());
+        assert_eq!(v, "a");
+
+        assert!(iter.next().is_none());
     }
 }

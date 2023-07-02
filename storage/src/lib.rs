@@ -25,7 +25,7 @@ mod test {
 
     use crate::{
         key::{InternalKey, KeyType},
-        kv::{Imemtable, Memtable},
+        kv::{Memtable},
         WriteOption,
     };
 
@@ -80,8 +80,8 @@ mod test {
     }
 
     #[allow(unused)]
-    pub fn init_itable() -> (Vec<(String, u64)>, Imemtable, u64) {
+    pub fn init_itable() -> (Vec<(String, u64)>, Memtable, u64) {
         let (sorted_input, table, ver) = crate::test::init_table();
-        (sorted_input, Imemtable::new(table), ver)
+        (sorted_input, table, ver)
     }
 }

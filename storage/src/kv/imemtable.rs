@@ -15,78 +15,13 @@ use crate::{
     key::{InternalKey, Value},
 };
 
-#[derive(Debug)]
-pub struct Imemtable {
-    m: Memtable,
-}
-
-impl Imemtable {
-    pub fn new(memtable: Memtable) -> Self {
-        Self { m: memtable }
-    }
-}
-
-impl Imemtable {
-    pub fn min_max_user_key(&self) -> Option<(Bytes, Bytes)> {
-        if !self.m.is_empty() {
-            Some((self.m.first_key().user_key(), self.m.last_key().user_key()))
-        } else {
-            None
-        }
-    }
-
-    pub fn min_seq(&self) -> u64 {
-        self.m.min_seq()
-    }
-
-    pub fn max_seq(&self) -> u64 {
-        self.m.max_seq()
-    }
-
-    pub fn entry_iter<'a>(&'a self) -> Box<dyn Iterator<Item = (InternalKey, Bytes)> + 'a> {
-        Box::new(self.m.iter().cloned())
-    }
-
-    pub fn len(&self) -> usize {
-        self.m.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.m.is_empty()
-    }
-
-    pub fn number(&self) -> u64 {
-        self.m.number()
-    }
-}
-
-impl Imemtable {
-    pub fn get<'a>(
-        &self,
-        opt: &GetOption,
-        key: Bytes,
-        _lifetime: &Lifetime<'a>,
-    ) -> Result<(InternalKey, Value)> {
-        self.m.get(opt, key, _lifetime)
-    }
-
-    pub fn scan<'a, R: RangeBounds<Bytes> + Clone>(
-        &self,
-        opt: &GetOption,
-        range: R,
-        _mark: &Lifetime<'a>,
-    ) -> ScanIter<'a, (InternalKey, Value)> {
-        self.m.scan(opt, range, _mark)
-    }
-}
-
 #[derive(Debug, Clone, Default)]
 pub struct Imemtables {
-    pub imemtables: Vec<Arc<Imemtable>>,
+    pub imemtables: Vec<Arc<Memtable>>,
 }
 
 impl Imemtables {
-    pub fn iter(&self) -> impl Iterator<Item = &Arc<Imemtable>> {
+    pub fn iter(&self) -> impl Iterator<Item = &Arc<Memtable>> {
         self.imemtables.iter()
     }
 
@@ -94,7 +29,7 @@ impl Imemtables {
         self.imemtables.is_empty()
     }
 
-    pub fn push(&self, imemtable: Arc<Imemtable>) -> Self {
+    pub fn push(&self, imemtable: Arc<Memtable>) -> Self {
         let mut imemtables = self.imemtables.clone();
         imemtables.push(imemtable);
 
@@ -126,6 +61,8 @@ impl Imemtables {
                 Ok(value) => return Ok(value),
                 Err(e) => {
                     if let StorageError::KeyNotExist = e {
+                        continue
+                    } else {
                         return Err(e);
                     }
                 }

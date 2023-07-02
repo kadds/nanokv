@@ -85,7 +85,7 @@ impl WriteablePersist for LocalFileBasedWriteablePersist {
 pub struct LocalFileBasedPersistBackend;
 
 impl PersistBackend for LocalFileBasedPersistBackend {
-    fn open(&self, path: PathBuf, enable_mmap: bool) -> Result<Box<dyn ReadablePersist>> {
+    fn open(&self, path: &Path, enable_mmap: bool) -> Result<Box<dyn ReadablePersist>> {
         let f = File::open(path)?;
         let mmap = if enable_mmap {
             let mmap = unsafe { memmap2::Mmap::map(&f)? };
@@ -103,7 +103,7 @@ impl PersistBackend for LocalFileBasedPersistBackend {
         }
     }
 
-    fn create(&self, path: PathBuf, truncate: Option<u64>) -> Result<Box<dyn WriteablePersist>> {
+    fn create(&self, path: &Path, truncate: Option<u64>) -> Result<Box<dyn WriteablePersist>> {
         let file = File::create(path)?;
         if let Some(t) = truncate {
             file.set_len(t)?;
@@ -112,7 +112,7 @@ impl PersistBackend for LocalFileBasedPersistBackend {
         Ok(Box::new(LocalFileBasedWriteablePersist { f: file }))
     }
 
-    fn remove(&self, path: PathBuf) -> Result<()> {
+    fn remove(&self, path: &Path) -> Result<()> {
         fs::remove_file(path)?;
         Ok(())
     }
@@ -124,8 +124,14 @@ impl PersistBackend for LocalFileBasedPersistBackend {
         }
     }
 
-    fn make_sure_dir(&self, path: PathBuf) -> Result<()> {
+    fn make_sure_dir(&self, path: &Path) -> Result<()> {
         fs::create_dir_all(path)?;
         Ok(())
     }
+
+    fn rename(&self, src: &Path, dst: &Path) -> Result<()> {
+        fs::rename(src, dst)?;
+        Ok(())
+    }
+
 }

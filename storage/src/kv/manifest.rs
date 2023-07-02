@@ -554,31 +554,6 @@ impl VersionSet {
     }
 }
 
-fn clear_log(config: &Config, seq: u64) {
-    let path = fname::manifest_name(config, seq);
-    let parent = path.parent().unwrap();
-    info!("{:?}", parent);
-    for file in parent.read_dir().unwrap() {
-        match file {
-            Ok(file) => {
-                if let Some(v) = file
-                    .path()
-                    .file_stem()
-                    .and_then(|n| n.to_str())
-                    .and_then(|v| v.parse::<u64>().ok())
-                {
-                    if v != seq {
-                        let _ = fs::remove_file(file.path());
-                    }
-                }
-            }
-            Err(err) => {
-                warn!("{:?} list {}", parent.as_os_str(), err)
-            }
-        }
-    }
-}
-
 pub const MAX_LEVEL: u32 = 8;
 
 pub struct Manifest<'a> {
@@ -598,14 +573,12 @@ impl<'a> Manifest<'a> {
         let current_path = fname::manifest_current(config);
         let current_tmp_path = fname::manifest_current_tmp(config);
 
-        let seq = Self::load_current_log_sequence(&current_path).unwrap_or_default();
-        info!("restore {:?} current seq {}", current_path.as_os_str(), seq);
+        let seq = Self::load_current_log_sequence(backend, &current_path).unwrap_or_default();
+        info!("restore {:?} current log seq {}", current_path.as_os_str(), seq);
 
         let wal = LogWriter::new(backend.clone(), ManifestLogSerializer);
-        if !config.no_wal {
-            let path = manifest_name(config, seq + 1);
-            wal.rotate(path).unwrap();
-        }
+        let path = manifest_name(config, seq + 1);
+        wal.rotate(path).unwrap();
 
         let mut this = Self {
             config,
@@ -620,7 +593,6 @@ impl<'a> Manifest<'a> {
         this.restore_from_wal(seq).unwrap();
 
         this.save_current_log();
-        clear_log(config, seq + 2);
 
         this.version_set.lock().unwrap().last_manifest_num = seq + 2;
         this.remove_unused_wal(seq + 1);
@@ -629,9 +601,9 @@ impl<'a> Manifest<'a> {
         this
     }
 
-    pub fn load_current_log_sequence(path: &PathBuf) -> Option<u64> {
+    pub fn load_current_log_sequence(backend: &Backend, path: &PathBuf) -> Option<u64> {
         let mut buf = String::new();
-        if let Err(e) = File::open(path).map(|mut f| f.read_to_string(&mut buf)) {
+        if let Err(e) = backend.fs.open(path, false).map(|mut f| f.read_to_string(&mut buf)) {
             warn!("{:?} read {}", path.as_os_str(), e);
         }
         buf.parse().ok()
@@ -639,15 +611,13 @@ impl<'a> Manifest<'a> {
 
     pub fn save_current_log(&self) {
         let seq = self.seq.load(Ordering::Acquire);
-        let _ = File::create(&self.current_tmp_path)
-            .unwrap()
-            .write(seq.to_string().as_bytes());
+        let _ = self.backend.fs.create(&self.current_tmp_path, None).unwrap().write(seq.to_string().as_bytes());
 
-        fs::rename(&self.current_tmp_path, &self.current_path).unwrap();
+        self.backend.fs.rename(&self.current_tmp_path, &self.current_path).unwrap();
     }
 
     pub fn current_log_sequence(&self) -> Option<u64> {
-        Self::load_current_log_sequence(&self.current_path)
+        Self::load_current_log_sequence(self.backend, &self.current_path)
     }
 
     fn restore_from_wal(&mut self, seq: u64) -> Result<()> {
@@ -681,9 +651,10 @@ impl<'a> Manifest<'a> {
 }
 
 impl<'a> Manifest<'a> {
-    fn commit(&self, edit: &VersionEdit) {
-        self.wal.lock().unwrap().append(edit);
-        self.wal.lock().unwrap().sync();
+    fn commit(&self, edit: &VersionEdit) -> Result<()> {
+        self.wal.lock().unwrap().append(edit)?;
+        self.wal.lock().unwrap().sync()?;
+        Ok(())
     }
 
     fn rotate(&self) {
@@ -718,7 +689,7 @@ impl<'a> Manifest<'a> {
         {
             let wal = self.wal.lock().unwrap();
             let path = manifest_name(self.config, old_seq);
-            let _ = self.backend.fs.remove(path);
+            let _ = self.backend.fs.remove(&path);
         }
     }
 
@@ -763,13 +734,13 @@ impl<'a> Manifest<'a> {
     pub fn add_sst_with<F: FnOnce(Arc<Version>)>(&self, meta: FileMetaData, new_run: bool, f: F) {
         if new_run {
             let edit = VersionEdit::NewRun(meta.level as u64);
-            self.commit(&edit);
+            self.commit(&edit).unwrap();
             let mut vs = self.version_set.lock().unwrap();
             vs.add(&edit);
         }
         let num = meta.number;
         let edit = VersionEdit::SSTAppended(meta);
-        self.commit(&edit);
+        self.commit(&edit).unwrap();
         let mut vs = self.version_set.lock().unwrap();
         vs.add(&edit);
         info!("add sst {} {:?}", num, vs.current());
