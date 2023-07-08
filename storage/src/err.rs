@@ -21,6 +21,8 @@ pub enum StorageError {
     Unknown,
     #[error("value too large")]
     ValueTooLarge,
+    #[error("data corrupt")]
+    DataCorrupt,
     #[error("io fail {0}")]
     Io(#[from] io::Error),
 }

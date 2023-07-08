@@ -1,19 +1,14 @@
 use std::{
-    fs::File,
-    io::{self, BufReader, Read},
+    io::{self, Read},
     marker::PhantomData,
     path::PathBuf,
-    sync::Arc, fmt::Write,
 };
 
 use byteorder::{ReadBytesExt, LE};
-use bytes::{
-    buf::{Reader, Writer},
-    Buf, BufMut, BytesMut,
-};
+use bytes::Buf;
 
 use crate::{
-    backend::{fs::ReadablePersist, Backend, BackendRef},
+    backend::{fs::ReadablePersist, Backend},
     err::Result,
     util::crc::crc_unmask,
 };
@@ -208,19 +203,26 @@ where
     }
 }
 
-pub struct DummySegmentRead<R>(R) where R: Read;
+pub struct DummySegmentRead<R>(R)
+where
+    R: Read;
 
-impl<R> DummySegmentRead<R> where R: Read {
+impl<R> DummySegmentRead<R>
+where
+    R: Read,
+{
     pub fn new(r: R) -> Self {
         Self(r)
     }
 }
 
-impl<R> Read for DummySegmentRead<R> where R: Read {
+impl<R> Read for DummySegmentRead<R>
+where
+    R: Read,
+{
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.0.read(buf)
     }
 }
 
-impl<R> SegmentRead  for DummySegmentRead<R> where R: Read {
-}
+impl<R> SegmentRead for DummySegmentRead<R> where R: Read {}

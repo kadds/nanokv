@@ -1,22 +1,19 @@
 use std::{
-    cell::RefCell,
-    fs::{self, File},
-    io::{self, Read, Seek, Write},
+    io::{self, Write},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::Mutex,
 };
 
 use byteorder::{WriteBytesExt, LE};
-use bytes::{buf::Writer, BufMut, BytesMut};
+use bytes::BufMut;
 
 use crate::{
-    backend::{fs::WriteablePersist, Backend, BackendRef},
-    err::{Result, StorageError},
+    backend::{fs::WriteablePersist, Backend},
+    err::Result,
     util::crc::crc_mask,
-    ConfigRef,
 };
 
-use super::{LogEntrySerializer, LogSegmentFlags, SEGMENT_SIZE, replayer::SegmentRead};
+use super::{LogEntrySerializer, LogSegmentFlags, SEGMENT_SIZE};
 
 const DEFAULT_ALLOC_SIZE: u64 = 1024 * 1024 * 5; // 5MB
 
@@ -49,17 +46,17 @@ where
         let mut buffer: [u8; 8] = [0; 8];
         let mut crc_builder = crc32fast::Hasher::new();
         let mut w = buffer.writer();
-        w.write_u32::<LE>(0);
-        w.write_u8(flags);
-        w.write_u8(0);
-        w.write_u16::<LE>(length);
-        w.flush();
+        let _ = w.write_u32::<LE>(0);
+        let _ = w.write_u8(flags);
+        let _ = w.write_u8(0);
+        let _ = w.write_u16::<LE>(length);
+        let _ = w.flush();
 
         crc_builder.update(&buffer);
         crc_builder.update(&payload[..length as usize]);
 
         let crc = crc_mask(crc_builder.finalize());
-        buffer.writer().write_u32::<LE>(crc);
+        let _ = buffer.writer().write_u32::<LE>(crc);
         buffer
     }
 
@@ -218,10 +215,7 @@ where
 
         let mut write_buffer = vec![];
         write_buffer.resize(SEGMENT_SIZE, 0);
-        let file = self
-            .backend
-            .fs
-            .create(&path, Some(DEFAULT_ALLOC_SIZE))?;
+        let file = self.backend.fs.create(&path, Some(DEFAULT_ALLOC_SIZE))?;
         inner.current = Some((file, write_buffer));
         inner.write_bytes = 0;
 
@@ -234,16 +228,19 @@ pub struct DummySegmentWrite<W> {
     len: usize,
 }
 
-impl<W> DummySegmentWrite<W> where W: Write {
+impl<W> DummySegmentWrite<W>
+where
+    W: Write,
+{
     pub fn new(w: W) -> Self {
-        Self {
-            w,
-            len: 0,
-        }
+        Self { w, len: 0 }
     }
 }
 
-impl<W> Write for DummySegmentWrite<W> where W:Write{
+impl<W> Write for DummySegmentWrite<W>
+where
+    W: Write,
+{
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let r = self.w.write(buf)?;
         self.len += r;
@@ -255,7 +252,10 @@ impl<W> Write for DummySegmentWrite<W> where W:Write{
     }
 }
 
-impl<W> SegmentWrite for DummySegmentWrite<W> where W:Write {
+impl<W> SegmentWrite for DummySegmentWrite<W>
+where
+    W: Write,
+{
     fn flush_all(self) -> io::Result<u64> {
         let r = self.len as u64;
         Ok(r)

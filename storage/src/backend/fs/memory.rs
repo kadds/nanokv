@@ -4,10 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use bytes::{
-    buf::{Reader, Writer},
-    Buf, BufMut, Bytes, BytesMut,
-};
+use bytes::{buf::Writer, BufMut, Bytes, BytesMut};
 
 use super::*;
 
@@ -90,7 +87,7 @@ impl Drop for WriteableMemoryBasedPersist {
 }
 
 impl PersistBackend for MemoryBasedPersistBackend {
-    fn open(&self, path: &Path, enable_mmap: bool) -> Result<Box<dyn ReadablePersist>> {
+    fn open(&self, path: &Path, _enable_mmap: bool) -> Result<Box<dyn ReadablePersist>> {
         let files = self.files.lock().unwrap();
         let bytes = files
             .get(path.to_str().unwrap())
@@ -110,7 +107,7 @@ impl PersistBackend for MemoryBasedPersistBackend {
         }
     }
 
-    fn create(&self, path: &Path, truncate: Option<u64>) -> Result<Box<dyn WriteablePersist>> {
+    fn create(&self, path: &Path, _truncate: Option<u64>) -> Result<Box<dyn WriteablePersist>> {
         Ok(Box::new(WriteableMemoryBasedPersist {
             bytes: Some(BytesMut::new().writer()),
             path: path.to_str().unwrap().to_owned(),
@@ -133,7 +130,7 @@ impl PersistBackend for MemoryBasedPersistBackend {
         }
     }
 
-    fn make_sure_dir(&self, path: &Path) -> Result<()> {
+    fn make_sure_dir(&self, _path: &Path) -> Result<()> {
         Ok(())
     }
 
@@ -147,5 +144,4 @@ impl PersistBackend for MemoryBasedPersistBackend {
 
         Ok(())
     }
-
 }

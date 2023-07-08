@@ -25,7 +25,7 @@ mod test {
 
     use crate::{
         key::{InternalKey, KeyType},
-        kv::{Memtable},
+        kv::Memtable,
         WriteOption,
     };
 

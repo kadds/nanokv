@@ -1,10 +1,10 @@
 use byteorder::{ByteOrder, WriteBytesExt};
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use integer_encoding::{VarIntReader, VarIntWriter};
 use log::debug;
 
-use crate::backend::Backend;
 use crate::backend::fs::WriteablePersist;
+use crate::backend::Backend;
 use crate::err::*;
 use crate::iterator::{EqualFilter, KvIteratorItem, ScanIter};
 use crate::key::{InternalKey, Value};
@@ -124,7 +124,7 @@ impl RawSSTReader {
 }
 
 impl RawSSTReaderInner {
-    fn lower_bound(&self, key: &Bytes) -> u64 {
+    fn lower_bound(&self, key: &Bytes) -> Result<u64> {
         let key = unsafe {
             std::str::from_utf8_unchecked(std::slice::from_raw_parts(key.as_ptr(), key.len()))
         };
@@ -132,21 +132,21 @@ impl RawSSTReaderInner {
 
         let mut size = self.meta.total_keys;
         if size == 0 {
-            return 0;
+            return Ok(0);
         }
         let mut base = 0u64;
         while size > 1 {
             let half = size / 2;
             let mid = base + half;
-            let cmp = unsafe { self.index_key_unchecked(mid).cmp(key) };
+            let cmp = unsafe { self.index_key_unchecked(mid)?.cmp(key) };
             base = if cmp == Less { mid } else { base };
             size -= half;
         }
-        let cmp = unsafe { self.index_key_unchecked(base).cmp(key) };
-        base + (cmp == Less) as u64
+        let cmp = unsafe { self.index_key_unchecked(base)?.cmp(key) };
+        Ok(base + (cmp == Less) as u64)
     }
 
-    fn upper_bound(&self, key: &Bytes) -> u64 {
+    fn upper_bound(&self, key: &Bytes) -> Result<u64> {
         let key = unsafe {
             std::str::from_utf8_unchecked(std::slice::from_raw_parts(key.as_ptr(), key.len()))
         };
@@ -154,18 +154,18 @@ impl RawSSTReaderInner {
 
         let mut size = self.meta.total_keys;
         if size == 0 {
-            return 0;
+            return Ok(0);
         }
         let mut base = 0u64;
         while size > 1 {
             let half = size / 2;
             let mid = base + half;
-            let cmp = unsafe { self.index_key_unchecked(mid).cmp(key) };
+            let cmp = unsafe { self.index_key_unchecked(mid)?.cmp(key) };
             base = if cmp == Greater { base } else { mid };
             size -= half;
         }
-        let cmp = unsafe { self.index_key_unchecked(base).cmp(key) };
-        base + (cmp != Greater) as u64
+        let cmp = unsafe { self.index_key_unchecked(base)?.cmp(key) };
+        Ok(base + (cmp != Greater) as u64)
     }
 
     #[allow(unused)]
@@ -178,7 +178,7 @@ impl RawSSTReaderInner {
     fn index(&self, index: u64) -> Result<RawSSTEntry> {
         let slice = self.mmap.get(0..self.size as usize).unwrap();
         if index >= self.meta.total_keys {
-            return Err(StorageError::Unknown);
+            return Err(StorageError::DataCorrupt);
         }
         let offset = LE::read_u64(&slice[(self.meta.index_offset + index * 8) as usize..]);
         let slice = &slice[offset as usize..];
@@ -186,15 +186,15 @@ impl RawSSTReaderInner {
     }
 
     #[allow(unused)]
-    fn index_key(&self, index: u64) -> &str {
+    fn index_key(&self, index: u64) -> Result<&str> {
         let slice = self.mmap.get(0..self.size as usize).unwrap();
         let offset = LE::read_u64(&slice[(self.meta.index_offset + index * 8) as usize..]);
-        RawSSTEntry::read_key(&slice[offset as usize..])
+        RawSSTEntry::read_user_key(&slice[offset as usize..])
     }
-    unsafe fn index_key_unchecked(&self, index: u64) -> &str {
+    unsafe fn index_key_unchecked(&self, index: u64) -> Result<&str> {
         let slice = self.mmap.get(0..self.size as usize).unwrap_unchecked();
         let offset = LE::read_u64(&slice[(self.meta.index_offset + index * 8) as usize..]);
-        RawSSTEntry::read_key(&slice[offset as usize..])
+        RawSSTEntry::read_user_key(&slice[offset as usize..])
     }
 }
 
@@ -206,8 +206,8 @@ impl SSTReader for RawSSTReader {
         _lifetime: &Lifetime<'a>,
     ) -> Result<(InternalKey, Value)> {
         let ver = opt.snapshot().map(|v| v.sequence()).unwrap_or(u64::MAX);
-        let mut index = self.inner.lower_bound(&key);
-        loop {
+        let mut index = self.inner.lower_bound(&key)?;
+        while index < self.inner.meta.total_keys {
             let (internal_key, value) = match self.inner.index(index) {
                 Ok(e) => e.into(),
                 Err(e) => return Err(e),
@@ -233,13 +233,13 @@ impl SSTReader for RawSSTReader {
         _mark: &Lifetime<'a>,
     ) -> ScanIter<'a, (InternalKey, Value)> {
         let beg = match beg {
-            std::ops::Bound::Included(val) => self.inner.lower_bound(&val),
-            std::ops::Bound::Excluded(val) => self.inner.upper_bound(&val),
+            std::ops::Bound::Included(val) => self.inner.lower_bound(&val).unwrap(),
+            std::ops::Bound::Excluded(val) => self.inner.upper_bound(&val).unwrap(),
             std::ops::Bound::Unbounded => 0,
         };
         let end = match end {
-            std::ops::Bound::Included(val) => self.inner.upper_bound(&val),
-            std::ops::Bound::Excluded(val) => self.inner.lower_bound(&val),
+            std::ops::Bound::Included(val) => self.inner.upper_bound(&val).unwrap(),
+            std::ops::Bound::Excluded(val) => self.inner.lower_bound(&val).unwrap(),
             std::ops::Bound::Unbounded => self.inner.meta.total_keys,
         };
 
@@ -329,17 +329,11 @@ impl RawSSTEntry {
         })
     }
 
-    fn read_key(buf: &[u8]) -> &str {
-        let mut offset = 0;
-        let _flags = LE::read_u64(&buf[offset..]);
-        offset += 8;
-        let _version = LE::read_u64(&buf[offset..]);
-        offset += 8;
-        let key_len = LE::read_u32(&buf[offset..]);
-        offset += 4;
-        // offset += key_len as usize;
+    fn read_user_key(mut buf: &[u8]) -> Result<&str> {
+        let key_len = buf.read_varint::<usize>()? - 8;
+        let _ = buf.read_varint::<usize>()?;
 
-        unsafe { std::str::from_utf8_unchecked(&buf[offset..(offset + key_len as usize)]) }
+        Ok(unsafe { std::str::from_utf8_unchecked(&buf[..(key_len as usize)]) })
     }
 }
 
@@ -449,9 +443,9 @@ impl SSTWriter for RawSSTWriter {
 
         let mut min_ver = u64::MAX;
         let mut max_ver = u64::MIN;
+        keys_offset.push(0);
 
         let mut cur = 0;
-        let mut n = 0;
         for (internal_key, value) in iter {
             // write key value entry
             if min_key.is_empty() {
@@ -464,7 +458,6 @@ impl SSTWriter for RawSSTWriter {
             last_entry = Some(internal_key);
 
             keys_offset.push(cur);
-            n += 1;
         }
         if let Some(entry) = last_entry {
             max_key = entry.user_key();
@@ -472,12 +465,11 @@ impl SSTWriter for RawSSTWriter {
         let key_offset_begin = cur;
         // write key offset
 
-        let keys = keys_offset.len() as u64;
+        let keys = keys_offset.len() as u64 - 1;
 
         for key_offset in keys_offset {
             let k = key_offset as u64;
-            let buf = k.to_le_bytes();
-            w.write_all(&buf).unwrap();
+            w.write_u64::<LE>(k)?;
         }
 
         let mut meta_info = RawSSTMetaInfo {
@@ -490,7 +482,7 @@ impl SSTWriter for RawSSTWriter {
             magic: RAWSST_MAGIC,
         };
 
-        meta_info.write(&mut w).unwrap();
+        meta_info.write(&mut w)?;
         w.flush().unwrap();
 
         debug!("write raw sst meta info {:?}", meta_info);

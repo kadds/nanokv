@@ -1,6 +1,6 @@
-use std::{fs, path::PathBuf};
+use std::path::PathBuf;
 
-use crate::{Config, ConfigRef};
+use crate::Config;
 
 pub fn sst_name(config: &Config, seq: u64) -> PathBuf {
     let mut base = config.path.join("sst").join(seq.to_string());

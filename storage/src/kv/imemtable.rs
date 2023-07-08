@@ -1,17 +1,11 @@
-use std::{
-    ops::RangeBounds,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-};
+use std::{ops::RangeBounds, sync::Arc};
 
 use bytes::Bytes;
 
 use super::{superversion::Lifetime, GetOption, Memtable};
 use crate::{
     err::{Result, StorageError},
-    iterator::{EqualFilter, KvIteratorItem, MergedIter, ScanIter},
+    iterator::{MergedIter, ScanIter},
     key::{InternalKey, Value},
 };
 
@@ -61,7 +55,7 @@ impl Imemtables {
                 Ok(value) => return Ok(value),
                 Err(e) => {
                     if let StorageError::KeyNotExist = e {
-                        continue
+                        continue;
                     } else {
                         return Err(e);
                     }

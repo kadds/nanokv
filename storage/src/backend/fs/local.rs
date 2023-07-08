@@ -1,16 +1,9 @@
+use super::*;
+use crate::err::StorageError;
 use std::{
-    collections::HashMap,
     fs::{self, File},
     io::{self, Read, Seek},
-    ops::Range,
-    sync::Mutex,
 };
-
-use bytes::Bytes;
-
-use crate::err::StorageError;
-
-use super::*;
 
 pub struct LocalFileBasedReadablePersist {
     f: File,
@@ -133,5 +126,4 @@ impl PersistBackend for LocalFileBasedPersistBackend {
         fs::rename(src, dst)?;
         Ok(())
     }
-
 }

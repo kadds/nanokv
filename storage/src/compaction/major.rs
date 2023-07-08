@@ -8,6 +8,7 @@ use rand::RngCore;
 use threadpool::ThreadPool;
 
 use crate::{
+    backend::Backend,
     iterator::{MergedIter, ScanIter},
     kv::{
         manifest::{FileMetaData, Version, MAX_LEVEL},
@@ -15,7 +16,7 @@ use crate::{
         superversion::{Lifetime, SuperVersion},
     },
     util::fname::{self},
-    Config, backend::Backend,
+    Config,
 };
 
 use super::CompactSerializer;
@@ -76,7 +77,8 @@ fn major_compaction(
         iters.push(file_reader.raw_scan(&lifetime))
     }
 
-    let mut writer = sst::raw_sst::RawSSTWriter::new(backend, fname::sst_name(&config, info.number));
+    let mut writer =
+        sst::raw_sst::RawSSTWriter::new(backend, fname::sst_name(&config, info.number));
 
     let iter = ScanIter::new(MergedIter::new(iters));
 
@@ -107,7 +109,7 @@ impl MajorCompactionTaskPool {
             config: Arc::new(config.clone()),
             f: Arc::new(f),
             factor: AtomicU32::new(10),
-            backend: unsafe {std::mem::transmute(backend)},
+            backend: unsafe { std::mem::transmute(backend) },
             stop: AtomicBool::new(false).into(),
         })
     }
@@ -152,73 +154,74 @@ fn pick_compaction_info(_config: &Config, version: &Version) -> Option<CompactIn
     // check level 0
     let mut info = CompactInfo::default();
     let mut cancel = false;
+    None
 
-    if version.level_size(0) >= 4 {
-        let mut num = 0;
-        for fs in version.level_n(0) {
-            if fs.is_using_relaxed() {
-                num += 1;
-            }
-        }
+    // if version.level_size(0) >= 4 {
+    //     let mut num = 0;
+    //     for fs in version.level_n(0) {
+    //         if fs.is_using_relaxed() {
+    //             num += 1;
+    //         }
+    //     }
 
-        if num > 4 {
-            for fs in version.level_n(0) {
-                if fs.set_picked() {
-                    info.compact_bottom.push(fs.meta().number);
-                }
-            }
-        }
-        // level 1
-        for fs in version.level_n(1) {
-            if fs.set_picked() {
-                info.compact_top.push(fs.meta().number);
-                break;
-            }
-        }
-        info.level_top = 1;
+    //     if num > 4 {
+    //         for fs in version.level_n(0) {
+    //             if fs.set_picked() {
+    //                 info.compact_bottom.push(fs.meta().number);
+    //             }
+    //         }
+    //     }
+    //     // level 1
+    //     for fs in version.level_n(1) {
+    //         if fs.set_picked() {
+    //             info.compact_top.push(fs.meta().number);
+    //             break;
+    //         }
+    //     }
+    //     info.level_top = 1;
 
-        if info.compact_bottom.len() < 4 {
-            cancel = true;
-        }
-    } else {
-        for level in 1..MAX_LEVEL {
-            let mut num = 0;
-            for fs in version.level_n(level) {
-                if fs.is_using_relaxed() {
-                    num += 1;
-                }
-            }
+    //     if info.compact_bottom.len() < 4 {
+    //         cancel = true;
+    //     }
+    // } else {
+    //     for level in 1..MAX_LEVEL {
+    //         let mut num = 0;
+    //         for fs in version.level_n(level) {
+    //             if fs.is_using_relaxed() {
+    //                 num += 1;
+    //             }
+    //         }
 
-            if num > 1 {
-                for fs in version.level_n(0) {
-                    if fs.set_picked() {
-                        info.compact_bottom.push(fs.meta().number);
-                    }
-                }
-            }
-        }
-    }
-    if info.compact_bottom.is_empty() {
-        cancel = true;
-    }
+    //         if num > 1 {
+    //             for fs in version.level_n(0) {
+    //                 if fs.set_picked() {
+    //                     info.compact_bottom.push(fs.meta().number);
+    //                 }
+    //             }
+    //         }
+    //     }
+    // }
+    // if info.compact_bottom.is_empty() {
+    //     cancel = true;
+    // }
 
-    if cancel {
-        for seq in info.compact_bottom {
-            for fs in version.level_n(info.level_bottom) {
-                if fs.meta().number == seq {
-                    fs.set_using();
-                }
-            }
-        }
-        for seq in info.compact_top {
-            for fs in version.level_n(info.level_top) {
-                if fs.meta().number == seq {
-                    fs.set_using();
-                }
-            }
-        }
-        None
-    } else {
-        Some(info)
-    }
+    // if cancel {
+    //     for seq in info.compact_bottom {
+    //         for fs in version.level_n(info.level_bottom) {
+    //             if fs.meta().number == seq {
+    //                 fs.set_using();
+    //             }
+    //         }
+    //     }
+    //     for seq in info.compact_top {
+    //         for fs in version.level_n(info.level_top) {
+    //             if fs.meta().number == seq {
+    //                 fs.set_using();
+    //             }
+    //         }
+    //     }
+    //     None
+    // } else {
+    //     Some(info)
+    // }
 }

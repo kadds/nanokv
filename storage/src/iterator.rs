@@ -186,3 +186,33 @@ where
         self.iter.size_hint()
     }
 }
+
+pub struct LevelIter<'a, T> {
+    iters: Vec<ScanIter<'a, T>>,
+    pos: usize,
+}
+
+impl<'a, T> LevelIter<'a, T>
+where
+    T: KvIteratorItem,
+{
+    pub fn new(iters: Vec<ScanIter<'a, T>>) -> Self {
+        Self { iters, pos: 0 }
+    }
+}
+
+impl<'a, T> Iterator for LevelIter<'a, T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.pos >= self.iters.len() {
+                return None;
+            }
+            if let Some(v) = self.iters[self.pos].next() {
+                return Some(v);
+            }
+            self.pos += 1;
+        }
+    }
+}

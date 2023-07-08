@@ -139,9 +139,9 @@ fn main() {
                 if let Err(e) = storage.get(&GetOption::default(), key.clone()) {
                     if e == StorageError::KeyNotExist {
                         let _ = storage.get(&GetOption::with_debug(), key.clone());
-                        panic!("not found key {}", key);
+                        panic!("not found key {:?}", key);
                     }
-                    panic!("get error {:?}", e);
+                    panic!("get key {:?} error {:?}", key, e);
                 }
             }
         },
@@ -155,12 +155,12 @@ fn main() {
         || {
             for key in &del_keys {
                 if let Err(e) = storage.get(&GetOption::default(), key.clone()) {
-                    if e == StorageError::KeyNotExist {
-                        let value = storage.get(&GetOption::with_debug(), key.clone()).unwrap();
-
-                        panic!("{} should be deleted", key.clone());
+                    if e != StorageError::KeyNotExist {
+                        // let value = storage.get(&GetOption::with_debug(), key.clone()).unwrap();
+                        panic!("get error {:?} when query {:?}", e, key);
                     }
-                    panic!("get error {:?}", e);
+                } else {
+                    panic!("\n\n{:?} should be deleted", key);
                 }
             }
         },

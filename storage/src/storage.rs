@@ -9,23 +9,23 @@ use std::{
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use log::info;
+use log::{error, info};
 use ouroboros::self_referencing;
 
 use crate::{
-    backend::{Backend, BackendRef},
+    backend::Backend,
     cache::Cache,
     compaction::{major::MajorCompactionTaskPool, minor::MinorCompactionTaskPool},
     err::{Result, StorageError},
     iterator::{KvIteratorItem, MergedIter, ScanIter},
-    key::{KeyType, Value, WriteBatch, WriteBatchBuilder, BatchLogSerializer},
+    key::{BatchLogSerializer, KeyType, Value, WriteBatch, WriteBatchBuilder},
     kv::{
         manifest::VersionEdit, sst::SnapshotTable, superversion::SuperVersion, ColumnFamilyTables,
         Imemtables,
     },
     log::LogReplayer,
     snapshot::Snapshot,
-    util::fname::{self, manifest_name, sst_name, wal_name},
+    util::fname::{manifest_name, sst_name, wal_name},
     Config, GetOption, WriteOption,
 };
 use crate::{
@@ -108,7 +108,10 @@ impl Storage {
     pub fn clear(config: Config) {}
 
     pub fn new(config: Config, backend: Backend) -> Self {
-        backend.fs.make_sure_dir(&config.path.to_path_buf()).unwrap();
+        backend
+            .fs
+            .make_sure_dir(&config.path.to_path_buf())
+            .unwrap();
         backend
             .fs
             .make_sure_dir(&sst_name(&config, 0).parent().unwrap().to_path_buf())
@@ -171,7 +174,7 @@ impl Storage {
         // init compaction thread pool
 
         let inner2 = inner.clone();
-        let backend = unsafe { std::mem::transmute(inner.info.borrow_backend())};
+        let backend = unsafe { std::mem::transmute(inner.info.borrow_backend()) };
         let minor_pool = MinorCompactionTaskPool::new(&config, backend, move |meta| {
             inner2.info.with_manifest(|m| {
                 let number = meta.number;
@@ -189,24 +192,25 @@ impl Storage {
         });
 
         let inner2 = inner.clone();
-        let major_pool = MajorCompactionTaskPool::new(&config, backend, move |additional, removal| {
-            let mut vec = Vec::new();
-            for meta in additional {
-                vec.push(VersionEdit::SSTAppended(meta));
-            }
-            for seq in removal {
-                vec.push(VersionEdit::SSTRemove(seq));
-            }
-            inner2.info.with_manifest(|m| {
-                m.modify_with(vec, |current| {
-                    inner2.modify_super_version(move |sv| SuperVersion {
-                        cf_tables: sv.cf_tables.clone(),
-                        sst_version: current,
-                        step_version: sv.step_version + 1,
-                    });
-                })
+        let major_pool =
+            MajorCompactionTaskPool::new(&config, backend, move |additional, removal| {
+                let mut vec = Vec::new();
+                for meta in additional {
+                    vec.push(VersionEdit::SSTAppended(meta));
+                }
+                for seq in removal {
+                    vec.push(VersionEdit::SSTRemove(seq));
+                }
+                inner2.info.with_manifest(|m| {
+                    m.modify_with(vec, |current| {
+                        inner2.modify_super_version(move |sv| SuperVersion {
+                            cf_tables: sv.cf_tables.clone(),
+                            sst_version: current,
+                            step_version: sv.step_version + 1,
+                        });
+                    })
+                });
             });
-        });
 
         let mut this = Self {
             inner,
@@ -338,7 +342,7 @@ impl Storage {
 
         ScanIter::<'a, (Bytes, Value)>::new(
             MergedIter::new(iters)
-                .filter(|(key, value)| key.key_type() != KeyType::Del)
+                .filter(|(key, _)| key.key_type() != KeyType::Del)
                 .map(|(key, value)| (key.user_key(), value)),
         )
     }
@@ -365,25 +369,26 @@ impl Storage {
     pub fn set_batch(&self, opt: &WriteOption, batch: WriteBatch) -> Result<u64> {
         let inner = self.inner.as_ref();
         let tables = inner.tables.load();
-        let cur_ver = inner
+
+        let cur_seq = inner
             .info
             .with_manifest(|m| m.allocate_seq(batch.count() as u64));
 
-        inner.info.with_wal(|wal| {
+        inner.info.with_wal(|wal| -> Result<()> {
             if let Some(wal) = &wal {
-                wal.append(&batch);
+                wal.append(&batch)?;
                 if opt.fsync() {
-                    wal.sync();
+                    wal.sync()?;
                 }
             }
-        });
+            Ok(())
+        })?;
 
-        tables.memtable.set_batch(batch)?;
+        tables.memtable.set_batch(batch, cur_seq)?;
         if tables.memtable.full() {
             self.flush_memtable();
         }
-        self.major_pool.notify(&inner.super_version());
-        Ok(cur_ver)
+        Ok(cur_seq)
     }
 
     pub fn super_version(&self) -> Arc<SuperVersion> {
@@ -408,7 +413,8 @@ impl Storage {
         };
 
         for batch in iter {
-            tables.memtable.set_batch(batch.unwrap()).unwrap()
+            self.set_batch(&WriteOption::default(), batch.unwrap())
+                .unwrap();
         }
 
         info!("wal restore from {}", tables.memtable.max_seq());
@@ -458,7 +464,10 @@ impl Storage {
         self.flush_wait_imemtables();
 
         self.minor_pool.stop();
-        self.inner.info.with_manifest(|m| m.flush());
+        let e = self.inner.info.with_manifest(|m| m.flush());
+        if let Err(e) = e {
+            error!("flush {}", e);
+        }
     }
 }
 

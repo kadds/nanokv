@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::marker::PhantomData;
 use std::ops::{Bound, RangeBounds};
 
 use std::sync::atomic::AtomicU64;
@@ -10,7 +11,8 @@ use super::superversion::Lifetime;
 use super::GetOption;
 use crate::err::{Result, StorageError};
 use crate::iterator::{EqualFilter, KvIteratorItem, ScanIter};
-use crate::key::{InternalKey, KeyType, Value, WriteBatch};
+use crate::key::{InternalKey, KeyType, Value, WriteBatch, WriteBatchBuilder};
+use crate::WriteOption;
 
 #[derive(Debug, Eq, Ord, Clone)]
 struct LookupKeyValue {
@@ -38,9 +40,20 @@ impl<'a> KvIteratorItem for &'a LookupKeyValue {
 impl LookupKeyValue {
     pub fn new(key: InternalKey, value: &[u8]) -> Self {
         let mut bytes = BytesMut::default().writer();
-        bytes.write_u32::<LE>(key.data().len() as u32);
-        bytes.write(key.data());
-        bytes.write(value).unwrap();
+        let _ = bytes.write_u32::<LE>(key.data().len() as u32);
+        let _ = bytes.write(key.data());
+        let _ = bytes.write(value).unwrap();
+        Self {
+            bytes: bytes.into_inner().freeze(),
+        }
+    }
+
+    pub fn new_with_seq(key: InternalKey, seq: u64, value: &[u8]) -> Self {
+        let key = InternalKey::new(key.user_key(), seq, key.key_type());
+        let mut bytes = BytesMut::default().writer();
+        let _ = bytes.write_u32::<LE>(key.data().len() as u32);
+        let _ = bytes.write(key.data());
+        let _ = bytes.write(value).unwrap();
         Self {
             bytes: bytes.into_inner().freeze(),
         }
@@ -48,9 +61,9 @@ impl LookupKeyValue {
 
     pub fn new_lookup(key: &[u8], seq: u64) -> Self {
         let mut bytes = BytesMut::default().writer();
-        bytes.write_u32::<LE>((key.len() + 8) as u32);
-        bytes.write(key);
-        bytes.write_u64::<LE>(seq & 0xFFFF_FFFF_FFFF);
+        let _ = bytes.write_u32::<LE>((key.len() + 8) as u32);
+        let _ = bytes.write(key);
+        let _ = bytes.write_u64::<LE>(seq & 0xFFFF_FFFF_FFFF);
         Self {
             bytes: bytes.into_inner().freeze(),
         }
@@ -113,12 +126,11 @@ impl Memtable {
         }
     }
 
-    pub fn iter<'a>(&'a self) -> impl Iterator<Item = &'a (InternalKey, Bytes)> {
-        unsafe {
-            core::mem::transmute::<_, skiplist::ordered_skiplist::Iter<'a, _>>(
-                self.list.iter().map(|v| (v.internal_key(), v.value())),
-            )
-        }
+    pub fn iter(&self) -> impl Iterator<Item = (InternalKey, Bytes, PhantomData<&'_ ()>)> {
+        self.list.iter().map(|v| {
+            let res = (v.internal_key(), v.value());
+            (res.0, res.1, PhantomData::default())
+        })
     }
 
     pub fn full(&self) -> bool {
@@ -227,34 +239,21 @@ fn map_bound<T>(b: &Bound<T>) -> Bound<&T> {
 
 impl Memtable {
     pub fn set<B: AsRef<[u8]>>(&self, key: InternalKey, value: B) -> Result<()> {
-        let value = value.as_ref();
-        if self.list.is_empty() {
-            self.min_seq
-                .store(key.seq(), std::sync::atomic::Ordering::Release);
-        }
-        let kv = LookupKeyValue::new(key, value);
-        self.total_bytes
-            .fetch_add(kv.len() as u64, std::sync::atomic::Ordering::AcqRel);
-        let l = &self.list as *const skiplist::OrderedSkipList<LookupKeyValue>;
-        unsafe {
-            let l = (l as *mut skiplist::OrderedSkipList<LookupKeyValue>)
-                .as_mut()
-                .unwrap();
-            l.insert(kv);
-        }
-
-        Ok(())
+        let seq = key.seq();
+        let mut batch = WriteBatchBuilder::new(WriteOption::default());
+        batch.add_internal(key, value)?;
+        self.set_batch(batch.build(), seq)
     }
 
-    pub fn set_batch(&self, b: WriteBatch) -> Result<()> {
+    pub fn set_batch(&self, b: WriteBatch, mut seq: u64) -> Result<()> {
         if self.list.is_empty() {
             self.min_seq
-                .store(b.seq(), std::sync::atomic::Ordering::Release);
+                .store(seq, std::sync::atomic::Ordering::Release);
         }
 
         let l = &self.list as *const skiplist::OrderedSkipList<LookupKeyValue>;
         for (key, value) in b.iter() {
-            let kv = LookupKeyValue::new(key, &value);
+            let kv = LookupKeyValue::new_with_seq(key, seq, &value);
             self.total_bytes
                 .fetch_add(kv.len() as u64, std::sync::atomic::Ordering::AcqRel);
 
@@ -264,7 +263,10 @@ impl Memtable {
                     .unwrap();
                 l.insert(kv);
             }
+            seq += 1;
         }
+        self.max_seq
+            .store(seq + b.count() as u64, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 }

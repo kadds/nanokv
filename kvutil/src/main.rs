@@ -4,7 +4,7 @@ use bytes::Bytes;
 use clap::Parser;
 use opt::ManifestCommands;
 use storage::{
-    backend::{fs::local::LocalFileBasedPersistBackend, Backend, BackendRef},
+    backend::{fs::local::LocalFileBasedPersistBackend, Backend},
     iterator::KvIteratorItem,
     key::{InternalKey, KeyType, Value},
     kv::{
@@ -128,7 +128,7 @@ fn dump_manifest(base: String, show_step: bool) {
     let backend = Backend::new(LocalFileBasedPersistBackend);
 
     let final_state = {
-        let mut r = LogReplayer::new(&backend, ManifestLogSerializer);
+        let r = LogReplayer::new(&backend, ManifestLogSerializer);
         let mut state = VersionSet::default();
         for edit in r.iter(name).unwrap() {
             let edit = edit.unwrap();

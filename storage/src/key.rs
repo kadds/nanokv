@@ -1,14 +1,14 @@
 use std::io::{self, Write};
 
-use byteorder::{ReadBytesExt, WriteBytesExt, LE};
-use bytes::{buf::Writer, Buf, BufMut, Bytes, BytesMut};
-use num_enum::{IntoPrimitive, TryFromPrimitive};
 use crate::{
     err::{Result, StorageError},
     iterator::KvIteratorItem,
     log::{replayer::SegmentRead, wal::SegmentWrite, LogEntrySerializer},
     WriteOption,
 };
+use byteorder::{ReadBytesExt, WriteBytesExt, LE};
+use bytes::{buf::Writer, Buf, BufMut, Bytes, BytesMut};
+use num_enum::{IntoPrimitive, TryFromPrimitive};
 
 #[derive(IntoPrimitive, TryFromPrimitive, Eq, PartialEq, Debug)]
 #[repr(u8)]
@@ -50,8 +50,8 @@ impl InternalKey {
         let prefix: u8 = ty.into();
         let value = ((prefix as u64) << 56) | (seq & 0xFFFF_FFFF_FFFF);
 
-        bytes.write(&user_key);
-        bytes.write_u64::<LE>(value);
+        let _ = bytes.write(&user_key);
+        let _ = bytes.write_u64::<LE>(value);
         Self {
             bytes: bytes.into_inner().freeze(),
         }
@@ -128,7 +128,6 @@ pub struct WriteBatch {
 
 impl WriteBatch {
     pub fn iter(&self) -> BatchIter {
-        let mut r = self.bytes.clone().reader();
         BatchIter {
             inner: self,
             offset: 16,
@@ -326,7 +325,7 @@ impl LogEntrySerializer for BatchLogSerializer {
 
 #[cfg(test)]
 mod test {
-    use crate::log::{wal::{DummySegmentWrite}, replayer::DummySegmentRead};
+    use crate::log::{replayer::DummySegmentRead, wal::DummySegmentWrite};
 
     use super::*;
 

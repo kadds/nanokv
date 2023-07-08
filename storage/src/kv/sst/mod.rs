@@ -3,12 +3,13 @@ use std::ops::{Bound, RangeBounds};
 use bytes::Bytes;
 
 use crate::err::*;
+use crate::iterator::LevelIter;
 use crate::{
     cache::Cache,
     iterator::{MergedIter, ScanIter},
     key::{InternalKey, Value},
     snapshot::Snapshot,
-    Config, ConfigRef,
+    Config,
 };
 
 use super::{
@@ -68,27 +69,31 @@ impl<'a> SnapshotTable<'a> {
         lifetime: &Lifetime<'b>,
     ) -> Result<(InternalKey, Value)> {
         for level in 0..MAX_LEVEL {
-            let iter = self
-                .version
-                .level_n(level)
-                .filter(|fs| fs.meta().min_ver <= self.snapshot.sequence())
-                .map(|fs| {
-                    self.cache
-                        .get_opened_sst(config, fs.meta().level, fs.meta().number)
-                });
+            let runs = self.version.level_n(level);
+            for run in runs.iter().rev() {
+                // find key
+                if let Some(fs) = run.binary_find_file(&key[..]) {
+                    if fs.meta().min_ver > self.snapshot.sequence() {
+                        continue;
+                    }
+                    let sst_reader =
+                        self.cache
+                            .get_opened_sst(config, fs.meta().level, fs.meta().number);
 
-            for file_reader in iter {
-                match file_reader.get(opt, key.clone(), lifetime) {
-                    Ok(val) => return Ok(val),
-                    Err(e) => {
-                        if StorageError::KeyNotExist == e {
-                            continue
-                        } else {
-                            return Err(e);
+                    match sst_reader.get(opt, key.clone(), lifetime) {
+                        Ok(val) => return Ok(val),
+                        Err(e) => {
+                            if StorageError::KeyNotExist == e {
+                                // search next run
+                                continue;
+                            } else {
+                                return Err(e);
+                            }
                         }
                     }
                 }
             }
+            // search next level
         }
 
         Err(StorageError::KeyNotExist)
@@ -103,22 +108,29 @@ impl<'a> SnapshotTable<'a> {
     ) -> ScanIter<'b, (InternalKey, Value)> {
         let mut iters = Vec::new();
         for level in 0..MAX_LEVEL {
-            let iter = self
-                .version
-                .level_n(level)
-                .filter(|fs| fs.meta().min_ver <= self.snapshot.sequence())
-                .map(|fs| {
-                    self.cache
-                        .get_opened_sst(config, fs.meta().level, fs.meta().number)
-                });
+            let runs = self.version.level_n(level);
+            for run in runs.iter().rev() {
+                // find key
+                let mut file_iters = Vec::new();
+                for fs in run.files() {
+                    if fs.meta().min_ver > self.snapshot.sequence() {
+                        continue;
+                    }
+                    let sst_reader =
+                        self.cache
+                            .get_opened_sst(config, fs.meta().level, fs.meta().number);
 
-            for file_reader in iter {
-                iters.push(file_reader.scan(
-                    opt,
-                    range.start_bound().cloned(),
-                    range.end_bound().cloned(),
-                    lifetime,
-                ));
+                    file_iters.push(sst_reader.scan(
+                        opt,
+                        range.start_bound().cloned(),
+                        range.end_bound().cloned(),
+                        lifetime,
+                    ));
+                }
+
+                if file_iters.len() > 0 {
+                    iters.push(ScanIter::new(LevelIter::new(file_iters)));
+                }
             }
         }
 

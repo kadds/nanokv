@@ -1,8 +1,6 @@
 use std::{
     sync::{
-        self,
         atomic::{AtomicBool, Ordering},
-        mpsc::Receiver,
         Arc,
     },
     time::Instant,
@@ -12,12 +10,14 @@ use log::info;
 use threadpool::ThreadPool;
 
 use crate::{
+    backend::Backend,
     kv::{
         manifest::FileMetaData,
-        sst::{self, SSTWriter}, Memtable,
+        sst::{self, SSTWriter},
+        Memtable,
     },
     util::fname,
-    Config, ConfigRef, backend::Backend,
+    Config,
 };
 
 use super::CompactSerializer;
@@ -43,7 +43,8 @@ fn minor_compaction(
         let beg = Instant::now();
         let number = table.number();
         let iter = table.iter();
-        let mut sst = sst::raw_sst::RawSSTWriter::new(backend, fname::sst_name(&config, table.number()));
+        let mut sst =
+            sst::raw_sst::RawSSTWriter::new(backend, fname::sst_name(&config, table.number()));
 
         let meta = match sst.write(0, number, iter.map(|v| (v.0.clone(), v.1.clone().into()))) {
             Ok(v) => v,
@@ -61,7 +62,11 @@ fn minor_compaction(
 }
 
 impl MinorCompactionTaskPool {
-    pub fn new<F: Fn(FileMetaData) + Send + Sync + 'static>(config: &Config, backend: &Backend, f: F) -> Arc<Self> {
+    pub fn new<F: Fn(FileMetaData) + Send + Sync + 'static>(
+        config: &Config,
+        backend: &Backend,
+        f: F,
+    ) -> Arc<Self> {
         Arc::new(Self {
             pool: threadpool::Builder::new()
                 .num_threads(config.minor_compaction_threads as usize)
@@ -69,7 +74,7 @@ impl MinorCompactionTaskPool {
                 .build(),
             config: Arc::new(config.clone()),
             f: Arc::new(f),
-            backend: unsafe {std::mem::transmute(backend)},
+            backend: unsafe { std::mem::transmute(backend) },
             stop: AtomicBool::new(false).into(),
         })
     }
@@ -78,7 +83,7 @@ impl MinorCompactionTaskPool {
         let this = self.clone();
         let config = this.config.clone();
         let f = this.f.clone();
-        let stop_flag = this.stop.clone();
+        let _stop_flag = this.stop.clone();
         let backend = self.backend;
         this.clone()
             .pool

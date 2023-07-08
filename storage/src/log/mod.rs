@@ -1,4 +1,4 @@
-use std::io::{self, Read, Write};
+use std::io;
 
 pub mod replayer;
 pub mod wal;

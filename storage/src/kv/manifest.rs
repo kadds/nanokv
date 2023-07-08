@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, LinkedList},
     fmt::Debug,
-    fs::{self, File},
     io::{self, Read, Write},
     path::PathBuf,
     sync::{
@@ -16,12 +15,12 @@ use bytes::Bytes;
 use superslice::Ext;
 
 use crate::{
-    backend::{fs::local::LocalFileBasedPersistBackend, Backend, BackendRef},
-    err::{Result, StorageError},
+    backend::Backend,
+    err::Result,
     log::{self, replayer::SegmentRead, wal::SegmentWrite, LogEntrySerializer, LogWriter},
     snapshot::Snapshot,
     util::fname::{self, manifest_name},
-    Config, ConfigRef,
+    Config,
 };
 
 #[derive(Debug, Clone)]
@@ -38,6 +37,10 @@ impl Run {
             min: Bytes::new(),
             max: Bytes::new(),
         }
+    }
+
+    pub fn files(&self) -> &[Arc<FileStatistics>] {
+        &self.files
     }
 
     pub fn push(&mut self, sst: Arc<FileStatistics>) {
@@ -57,6 +60,24 @@ impl Run {
         } else {
             self.files.insert(idx, sst);
         }
+    }
+
+    pub fn binary_find_file(&self, key: &[u8]) -> Option<&FileStatistics> {
+        if &self.min > key || &self.max < key {
+            return None;
+        }
+        let idx = self
+            .files
+            .lower_bound_by(|val| (&val.meta.max[..]).cmp(key));
+        if idx >= self.files.len() {
+            ::log::info!(
+                "key {} in file {:?}",
+                String::from_utf8(key.into()).unwrap(),
+                self
+            );
+            return None;
+        }
+        Some(&self.files[idx])
     }
 }
 
@@ -94,20 +115,13 @@ impl Default for Version {
 }
 
 impl Version {
-    pub fn level_n(&self, n: u32) -> impl DoubleEndedIterator<Item = &FileStatistics> {
-        self.sst_files[n as usize]
-            .runs
-            .iter()
-            .flat_map(|r| r.files.iter().map(|f| f.as_ref()))
+    pub fn level_n(&self, n: u32) -> &[Run] {
+        &self.sst_files[n as usize].runs[..]
     }
     pub fn list_run<F: FnMut(&Run)>(&self, level: u32, mut f: F) {
         for run in &self.sst_files[level as usize].runs {
             f(run)
         }
-    }
-
-    pub fn level_size(&self, level: u32) -> u32 {
-        self.level_n(level).count() as u32
     }
 }
 
@@ -574,7 +588,11 @@ impl<'a> Manifest<'a> {
         let current_tmp_path = fname::manifest_current_tmp(config);
 
         let seq = Self::load_current_log_sequence(backend, &current_path).unwrap_or_default();
-        info!("restore {:?} current log seq {}", current_path.as_os_str(), seq);
+        info!(
+            "restore {:?} current log seq {}",
+            current_path.as_os_str(),
+            seq
+        );
 
         let wal = LogWriter::new(backend.clone(), ManifestLogSerializer);
         let path = manifest_name(config, seq + 1);
@@ -603,7 +621,11 @@ impl<'a> Manifest<'a> {
 
     pub fn load_current_log_sequence(backend: &Backend, path: &PathBuf) -> Option<u64> {
         let mut buf = String::new();
-        if let Err(e) = backend.fs.open(path, false).map(|mut f| f.read_to_string(&mut buf)) {
+        if let Err(e) = backend
+            .fs
+            .open(path, false)
+            .map(|mut f| f.read_to_string(&mut buf))
+        {
             warn!("{:?} read {}", path.as_os_str(), e);
         }
         buf.parse().ok()
@@ -611,9 +633,17 @@ impl<'a> Manifest<'a> {
 
     pub fn save_current_log(&self) {
         let seq = self.seq.load(Ordering::Acquire);
-        let _ = self.backend.fs.create(&self.current_tmp_path, None).unwrap().write(seq.to_string().as_bytes());
+        let _ = self
+            .backend
+            .fs
+            .create(&self.current_tmp_path, None)
+            .unwrap()
+            .write(seq.to_string().as_bytes());
 
-        self.backend.fs.rename(&self.current_tmp_path, &self.current_path).unwrap();
+        self.backend
+            .fs
+            .rename(&self.current_tmp_path, &self.current_path)
+            .unwrap();
     }
 
     pub fn current_log_sequence(&self) -> Option<u64> {
@@ -657,7 +687,7 @@ impl<'a> Manifest<'a> {
         Ok(())
     }
 
-    fn rotate(&self) {
+    fn rotate(&self) -> Result<()> {
         let old_seq = {
             let wal = self.wal.lock().unwrap();
             let old_seq = self.seq.load(Ordering::Acquire);
@@ -665,21 +695,21 @@ impl<'a> Manifest<'a> {
 
             let mut ver = self.version_set.lock().unwrap();
 
-            wal.append(&VersionEdit::VersionChanged(ver.last_seq));
-            wal.append(&VersionEdit::ManifestSequenceChanged(ver.last_manifest_num));
-            wal.append(&VersionEdit::SSTSequenceChanged(ver.last_sst_num));
+            wal.append(&VersionEdit::VersionChanged(ver.last_seq))?;
+            wal.append(&VersionEdit::ManifestSequenceChanged(ver.last_manifest_num))?;
+            wal.append(&VersionEdit::SSTSequenceChanged(ver.last_sst_num))?;
             // finish old wal file
 
             let path = manifest_name(self.config, seq);
 
-            wal.rotate(path);
+            wal.rotate(path)?;
             // new wal file
-            wal.append(&VersionEdit::Snapshot(ver.current()));
-            wal.append(&VersionEdit::VersionChanged(ver.last_seq));
-            wal.append(&VersionEdit::ManifestSequenceChanged(ver.last_manifest_num));
-            wal.append(&VersionEdit::SSTSequenceChanged(ver.last_sst_num));
+            wal.append(&VersionEdit::Snapshot(ver.current()))?;
+            wal.append(&VersionEdit::VersionChanged(ver.last_seq))?;
+            wal.append(&VersionEdit::ManifestSequenceChanged(ver.last_manifest_num))?;
+            wal.append(&VersionEdit::SSTSequenceChanged(ver.last_sst_num))?;
 
-            wal.sync();
+            wal.sync()?;
             self.seq.store(seq, Ordering::Release);
             old_seq
         };
@@ -687,14 +717,15 @@ impl<'a> Manifest<'a> {
             self.save_current_log();
         }
         {
-            let wal = self.wal.lock().unwrap();
+            let _m = self.wal.lock().unwrap();
             let path = manifest_name(self.config, old_seq);
             let _ = self.backend.fs.remove(&path);
         }
+        Ok(())
     }
 
-    pub fn flush(&self) {
-        self.rotate();
+    pub fn flush(&self) -> Result<()> {
+        self.rotate()
     }
 
     pub fn allocate_seq(&self, num: u64) -> u64 {
@@ -713,7 +744,7 @@ impl<'a> Manifest<'a> {
         let mut ver = self.version_set.lock().unwrap();
         let return_num = ver.last_sst_num;
         let edit = VersionEdit::SSTSequenceChanged(ver.last_sst_num + 1);
-        self.commit(&edit);
+        self.commit(&edit).unwrap();
 
         ver.add(&edit);
         return_num
@@ -751,10 +782,10 @@ impl<'a> Manifest<'a> {
     pub fn modify_with<F: FnOnce(Arc<Version>)>(&self, versions: Vec<VersionEdit>, f: F) {
         let mut vs = self.version_set.lock().unwrap();
         for v in versions {
-            self.wal.lock().unwrap().append(&v);
+            self.wal.lock().unwrap().append(&v).unwrap();
             vs.add(&v);
         }
-        self.wal.lock().unwrap().sync();
+        self.wal.lock().unwrap().sync().unwrap();
         f(vs.current());
     }
 
