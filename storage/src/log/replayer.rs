@@ -1,4 +1,5 @@
 use std::{
+    borrow::{Borrow, BorrowMut},
     io::{self, Read},
     marker::PhantomData,
     path::PathBuf,
@@ -6,9 +7,13 @@ use std::{
 
 use byteorder::{ReadBytesExt, LE};
 use bytes::Buf;
+use ouroboros::self_referencing;
 
 use crate::{
-    backend::{fs::ReadablePersist, Backend},
+    backend::{
+        fs::{ExtReader, ReadablePersist},
+        Backend,
+    },
     err::Result,
     util::crc::crc_unmask,
 };
@@ -137,11 +142,15 @@ where
     }
 }
 
+#[self_referencing]
 pub struct LogReplayerIter<'a, S, E> {
-    underlying: Box<dyn ReadablePersist>,
+    file: Box<dyn ReadablePersist>,
+    #[borrows(file)]
+    #[not_covariant]
+    underlying: ExtReader<'this>,
     cache: Vec<u8>,
     serializer: &'a S,
-    _pd: PhantomData<E>,
+    pd: PhantomData<E>,
 }
 
 impl<'a, S, E> Iterator for LogReplayerIter<'a, S, E>
@@ -151,22 +160,22 @@ where
     type Item = Result<E>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut r = SegmentReader::new(
-            self.underlying.as_mut(),
-            SEGMENT_SIZE as u64,
-            &mut self.cache,
-        );
-        let entry = match self.serializer.read(&mut r) {
-            Ok(e) => e,
-            Err(err) => {
-                if err.kind() == io::ErrorKind::UnexpectedEof {
-                    return None;
-                } else {
-                    return Some(Err(crate::err::StorageError::Io(err)));
+        let s = self.borrow_serializer();
+        self.with_mut(|f| {
+            let mut r = SegmentReader::new(f.underlying, SEGMENT_SIZE as u64, f.cache);
+
+            let entry = match s.read(&mut r) {
+                Ok(e) => e,
+                Err(err) => {
+                    if err.kind() == io::ErrorKind::UnexpectedEof {
+                        return None;
+                    } else {
+                        return Some(Err(crate::err::StorageError::Io(err)));
+                    }
                 }
-            }
-        };
-        Some(Ok(entry))
+            };
+            Some(Ok(entry))
+        })
     }
 }
 
@@ -191,15 +200,20 @@ where
         P: Into<PathBuf>,
     {
         let path = path.into();
-        let underlying = self.backend.fs.open(&path, false)?;
+        let file = self.backend.fs.open(&path, false)?;
+        let size = file.size();
         let mut cache = vec![];
         cache.resize(SEGMENT_SIZE, 0);
-        Ok(LogReplayerIter {
-            underlying,
+        Ok(LogReplayerIter::new(
+            file,
+            |file| {
+                let underlying = ExtReader::new(file.borrow(), 0, size);
+                underlying
+            },
             cache,
-            serializer: &self.serializer,
-            _pd: PhantomData::default(),
-        })
+            &self.serializer,
+            PhantomData::default(),
+        ))
     }
 }
 

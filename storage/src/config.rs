@@ -8,6 +8,7 @@ use std::path::PathBuf;
 pub struct Config {
     pub path: PathBuf,
     pub no_wal: bool,
+    pub enable_mmap: bool,
     pub minor_compaction_threads: u32,
     pub major_compaction_threads: u32,
     pub l0_compaction_files: u32,
@@ -22,6 +23,7 @@ impl Default for Config {
         Self {
             path: Default::default(),
             no_wal: false,
+            enable_mmap: true,
             minor_compaction_threads: 4,
             major_compaction_threads: 2,
             l0_compaction_files: 4,
@@ -30,12 +32,6 @@ impl Default for Config {
             size_tried_radio: 10,
             level_data_radio: 10,
         }
-    }
-}
-
-impl Config {
-    pub fn set_no_wal(&mut self, no_wal: bool) {
-        self.no_wal = no_wal;
     }
 }
 

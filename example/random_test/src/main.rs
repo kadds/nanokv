@@ -74,7 +74,8 @@ where
 fn main() {
     env_logger::init();
     let mut config = config::current_config();
-    config.set_no_wal(true);
+    config.no_wal = true;
+    config.enable_mmap = true;
     let backend = Backend::new(LocalFileBasedPersistBackend);
 
     // Instance::clean(config);

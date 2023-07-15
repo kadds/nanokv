@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use lru::LruCache;
 
 use crate::{
+    backend::Backend,
     kv::sst::{raw_sst::RawSSTReader, SSTReader},
     util::fname,
     Config,
@@ -24,15 +25,17 @@ impl Cache {
     pub fn get_opened_sst(
         &self,
         config: &Config,
-        _level: u32,
         seq: u64,
+        backend: &Backend,
     ) -> Arc<dyn SSTReader + Send + Sync> {
         let sst_path = fname::sst_name(config, seq);
 
         self.opened_sst
             .lock()
             .unwrap()
-            .get_or_insert(seq, || Arc::new(RawSSTReader::new(sst_path).unwrap()))
+            .get_or_insert(seq, || {
+                Arc::new(RawSSTReader::new(&sst_path, backend, config.enable_mmap).unwrap())
+            })
             .clone()
     }
 }

@@ -1,4 +1,5 @@
 use std::{
+    borrow::Borrow,
     collections::{BTreeMap, HashMap, LinkedList},
     fmt::Debug,
     io::{self, Read, Write},
@@ -15,7 +16,10 @@ use bytes::Bytes;
 use superslice::Ext;
 
 use crate::{
-    backend::Backend,
+    backend::{
+        fs::{ExtReader, ReadablePersist},
+        Backend,
+    },
     err::Result,
     log::{self, replayer::SegmentRead, wal::SegmentWrite, LogEntrySerializer, LogWriter},
     snapshot::Snapshot,
@@ -621,11 +625,10 @@ impl<'a> Manifest<'a> {
 
     pub fn load_current_log_sequence(backend: &Backend, path: &PathBuf) -> Option<u64> {
         let mut buf = String::new();
-        if let Err(e) = backend
-            .fs
-            .open(path, false)
-            .map(|mut f| f.read_to_string(&mut buf))
-        {
+        if let Err(e) = backend.fs.open(path, false).and_then(|mut f| {
+            let len = f.size();
+            Ok(ExtReader::new(f.as_ref(), 0, len).read_to_string(&mut buf))
+        }) {
             warn!("{:?} read {}", path.as_os_str(), e);
         }
         buf.parse().ok()

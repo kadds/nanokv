@@ -1,26 +1,30 @@
+use bytes::Buf;
+use positioned_io::RandomAccessFile;
+
 use super::*;
 use crate::err::StorageError;
 use std::{
     fs::{self, File},
-    io::{self, Read, Seek},
+    io::{self, Cursor, Seek},
+    path::PathBuf,
 };
 
 pub struct LocalFileBasedReadablePersist {
     f: File,
     mmap: Option<memmap2::Mmap>,
+    size: u64,
 }
 
-impl Read for LocalFileBasedReadablePersist {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.f.read(buf)
+impl ReadAt for LocalFileBasedReadablePersist {
+    fn read_at(&self, pos: u64, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(m) = &self.mmap {
+            (&m[pos as usize..]).reader().read(buf)
+        } else {
+            self.f.read_at(pos, buf)
+        }
     }
 }
 
-impl Seek for LocalFileBasedReadablePersist {
-    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        self.f.seek(pos)
-    }
-}
 impl ReadablePersist for LocalFileBasedReadablePersist {
     fn addr(&self) -> Result<&[u8]> {
         if let Some(m) = &self.mmap {
@@ -32,24 +36,13 @@ impl ReadablePersist for LocalFileBasedReadablePersist {
         )))
     }
 
-    // fn read_slice<'a>(&'a self, range: Range<usize>, buffer: &'a mut Vec<u8>) -> Result<&'a [u8]> {
-    //     if let Some(m) = &self.mmap {
-    //         Ok(&m[range])
-    //     } else {
-    //         *buffer = Vec::with_capacity(range.len());
-    //         unsafe {
-    //             let b = buffer.spare_capacity_mut();
-    //             self.f.read_exact( std::mem::transmute(&mut b[..]))?;
-    //             buffer.set_len(range.len());
-    //         }
-
-    //         Ok(&buffer[..])
-    //     }
-    // }
+    fn size(&self) -> u64 {
+        self.size
+    }
 }
-
 pub struct LocalFileBasedWriteablePersist {
     f: File,
+    path: PathBuf,
 }
 
 impl Write for LocalFileBasedWriteablePersist {
@@ -72,6 +65,11 @@ impl WriteablePersist for LocalFileBasedWriteablePersist {
         self.f.sync_data()?;
         Ok(())
     }
+
+    fn delete(&mut self) -> Result<()> {
+        fs::remove_file(&self.path)?;
+        Ok(())
+    }
 }
 
 #[derive(Default, Debug)]
@@ -79,14 +77,19 @@ pub struct LocalFileBasedPersistBackend;
 
 impl PersistBackend for LocalFileBasedPersistBackend {
     fn open(&self, path: &Path, enable_mmap: bool) -> Result<Box<dyn ReadablePersist>> {
+        let size = std::fs::metadata(path)?.len();
+
         let f = File::open(path)?;
+        #[cfg(all(unix, target_os = "linux"))]
+        {}
+
         let mmap = if enable_mmap {
             let mmap = unsafe { memmap2::Mmap::map(&f)? };
             Some(mmap)
         } else {
             None
         };
-        Ok(Box::new(LocalFileBasedReadablePersist { f, mmap }))
+        Ok(Box::new(LocalFileBasedReadablePersist { f, mmap, size }))
     }
 
     fn get_feature(&self) -> PersistFeature {
@@ -102,7 +105,10 @@ impl PersistBackend for LocalFileBasedPersistBackend {
             file.set_len(t)?;
         }
 
-        Ok(Box::new(LocalFileBasedWriteablePersist { f: file }))
+        Ok(Box::new(LocalFileBasedWriteablePersist {
+            f: file,
+            path: path.to_path_buf(),
+        }))
     }
 
     fn remove(&self, path: &Path) -> Result<()> {

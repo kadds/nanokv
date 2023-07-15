@@ -3,7 +3,7 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use rand::{distributions::Alphanumeric, Rng, RngCore};
 use storage::{
     backend::{fs::local::LocalFileBasedPersistBackend, Backend},
-    config, Config, Storage, WriteOption,
+    config, Storage, WriteOption,
 };
 
 fn rand_key() -> String {

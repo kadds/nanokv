@@ -67,7 +67,14 @@ fn major_compaction(
         .iter()
         .chain(info.compact_top.iter())
         .cloned()
-        .map(|seq| sst::raw_sst::RawSSTReader::new(fname::sst_name(&config, seq)).unwrap())
+        .map(|seq| {
+            sst::raw_sst::RawSSTReader::new(
+                &fname::sst_name(&config, seq),
+                backend,
+                config.enable_mmap,
+            )
+            .unwrap()
+        })
         .collect();
 
     let mut iters = Vec::new();

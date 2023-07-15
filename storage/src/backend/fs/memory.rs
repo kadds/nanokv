@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use bytes::{buf::Writer, BufMut, Bytes, BytesMut};
+use bytes::{buf::Writer, Buf, BufMut, Bytes, BytesMut};
 
 use super::*;
 
@@ -26,15 +26,9 @@ pub struct ReadableMemoryBasedPersist {
     bytes: Bytes,
 }
 
-impl Read for ReadableMemoryBasedPersist {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.cursor.read(buf)
-    }
-}
-
-impl Seek for ReadableMemoryBasedPersist {
-    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
-        self.cursor.seek(pos)
+impl ReadAt for ReadableMemoryBasedPersist {
+    fn read_at(&self, pos: u64, buf: &mut [u8]) -> io::Result<usize> {
+        (&self.bytes[pos as usize..]).reader().read(buf)
     }
 }
 
@@ -42,12 +36,17 @@ impl ReadablePersist for ReadableMemoryBasedPersist {
     fn addr(&self) -> Result<&[u8]> {
         Ok(&self.bytes)
     }
+
+    fn size(&self) -> u64 {
+        self.bytes.len() as u64
+    }
 }
 
 pub struct WriteableMemoryBasedPersist {
     bytes: Option<Writer<BytesMut>>,
     path: String,
     b: MemoryBasedPersistBackend,
+    delete: bool,
 }
 
 impl Write for WriteableMemoryBasedPersist {
@@ -74,15 +73,24 @@ impl WriteablePersist for WriteableMemoryBasedPersist {
     fn sync(&mut self) -> Result<()> {
         Ok(())
     }
+
+    fn delete(&mut self) -> Result<()> {
+        self.delete = true;
+        Ok(())
+    }
 }
 
 impl Drop for WriteableMemoryBasedPersist {
     fn drop(&mut self) {
         let mut files = self.b.files.lock().unwrap();
-        files.insert(
-            self.path.clone(),
-            self.bytes.take().unwrap().into_inner().freeze(),
-        );
+        if self.delete {
+            files.remove(&self.path);
+        } else {
+            files.insert(
+                self.path.clone(),
+                self.bytes.take().unwrap().into_inner().freeze(),
+            );
+        }
     }
 }
 
@@ -114,6 +122,7 @@ impl PersistBackend for MemoryBasedPersistBackend {
             b: MemoryBasedPersistBackend {
                 files: self.files.clone(),
             },
+            delete: false,
         }))
     }
 

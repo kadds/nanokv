@@ -1,19 +1,20 @@
-use byteorder::{ByteOrder, WriteBytesExt};
+use byteorder::{ByteOrder, ReadBytesExt, WriteBytesExt};
 use bytes::{Buf, Bytes, BytesMut};
 use integer_encoding::{VarIntReader, VarIntWriter};
 use log::debug;
+use positioned_io::ReadBytesAtExt;
 
-use crate::backend::fs::WriteablePersist;
+use crate::backend::fs::{ExtReader, ReadablePersist, WriteablePersist};
 use crate::backend::Backend;
-use crate::err::*;
 use crate::iterator::{EqualFilter, KvIteratorItem, ScanIter};
 use crate::key::{InternalKey, Value};
 use crate::kv::superversion::Lifetime;
-use crate::KvIterator;
+use crate::{err::*, ConfigRef};
+use crate::{Config, KvIterator};
 use byteorder::LE;
-use std::fs::File;
+use std::borrow::Borrow;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::{FileMetaData, SSTReader, SSTWriter};
@@ -75,8 +76,7 @@ pub struct RawSSTReaderFactory {}
 
 #[allow(unused)]
 struct RawSSTReaderInner {
-    mmap: memmap2::Mmap,
-    file: File,
+    file: Box<dyn ReadablePersist>,
     size: u64,
     meta: RawSSTMetaInfo,
     seq: u64,
@@ -87,24 +87,19 @@ pub struct RawSSTReader {
 }
 
 impl RawSSTReader {
-    pub fn new(name: PathBuf) -> io::Result<Self> {
-        let mut file = File::open(name)?;
-        let size = file.seek(SeekFrom::End(0))?;
-        file.seek(SeekFrom::Start(0))?;
+    pub fn new(name: &Path, backend: &Backend, enable_mmap: bool) -> Result<Self> {
+        let file = backend.fs.open(name, enable_mmap)?;
+        let meta = RawSSTMetaInfo::read(file.borrow() as &dyn ReadablePersist, file.size())?;
+        let size = file.size();
 
-        let mmap = unsafe { memmap2::Mmap::map(&file)? };
-        let slice = mmap.get(0..size as usize).unwrap();
-
-        let meta = RawSSTMetaInfo::read(slice)?;
         if meta.magic != RAWSST_MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "magic invalid"));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "magic invalid").into());
         }
         log::info!("read meta {:?}", meta);
 
         Ok(Self {
             inner: RawSSTReaderInner {
                 seq: meta.number,
-                mmap,
                 file,
                 meta,
                 size,
@@ -134,15 +129,17 @@ impl RawSSTReaderInner {
         if size == 0 {
             return Ok(0);
         }
+        let mut tmp = Vec::with_capacity(128);
+
         let mut base = 0u64;
         while size > 1 {
             let half = size / 2;
             let mid = base + half;
-            let cmp = unsafe { self.index_key_unchecked(mid)?.cmp(key) };
+            let cmp = unsafe { self.index_key_unchecked(mid, &mut tmp)?.cmp(key) };
             base = if cmp == Less { mid } else { base };
             size -= half;
         }
-        let cmp = unsafe { self.index_key_unchecked(base)?.cmp(key) };
+        let cmp = unsafe { self.index_key_unchecked(base, &mut tmp)?.cmp(key) };
         Ok(base + (cmp == Less) as u64)
     }
 
@@ -156,45 +153,33 @@ impl RawSSTReaderInner {
         if size == 0 {
             return Ok(0);
         }
+        let mut tmp = Vec::with_capacity(128);
+
         let mut base = 0u64;
         while size > 1 {
             let half = size / 2;
             let mid = base + half;
-            let cmp = unsafe { self.index_key_unchecked(mid)?.cmp(key) };
+            let cmp = unsafe { self.index_key_unchecked(mid, &mut tmp)?.cmp(key) };
             base = if cmp == Greater { base } else { mid };
             size -= half;
         }
-        let cmp = unsafe { self.index_key_unchecked(base)?.cmp(key) };
+        let cmp = unsafe { self.index_key_unchecked(base, &mut tmp)?.cmp(key) };
         Ok(base + (cmp != Greater) as u64)
     }
 
-    #[allow(unused)]
-    fn offset(&self, offset: u64) -> Result<RawSSTEntry> {
-        let slice = self.mmap.get(0..self.size as usize).unwrap();
-        let slice = &slice[offset as usize..];
-        RawSSTEntry::read(slice.reader())
-    }
-
     fn index(&self, index: u64) -> Result<RawSSTEntry> {
-        let slice = self.mmap.get(0..self.size as usize).unwrap();
         if index >= self.meta.total_keys {
             return Err(StorageError::DataCorrupt);
         }
-        let offset = LE::read_u64(&slice[(self.meta.index_offset + index * 8) as usize..]);
-        let slice = &slice[offset as usize..];
-        RawSSTEntry::read(slice.reader())
+        let f = self.file.borrow() as &dyn ReadablePersist;
+        let offset = f.read_u64_at::<LE>(self.meta.index_offset + index * 8)?;
+        RawSSTEntry::read(ExtReader::new(f, offset, self.size))
     }
 
-    #[allow(unused)]
-    fn index_key(&self, index: u64) -> Result<&str> {
-        let slice = self.mmap.get(0..self.size as usize).unwrap();
-        let offset = LE::read_u64(&slice[(self.meta.index_offset + index * 8) as usize..]);
-        RawSSTEntry::read_user_key(&slice[offset as usize..])
-    }
-    unsafe fn index_key_unchecked(&self, index: u64) -> Result<&str> {
-        let slice = self.mmap.get(0..self.size as usize).unwrap_unchecked();
-        let offset = LE::read_u64(&slice[(self.meta.index_offset + index * 8) as usize..]);
-        RawSSTEntry::read_user_key(&slice[offset as usize..])
+    unsafe fn index_key_unchecked<'a>(&self, index: u64, tmp: &'a mut Vec<u8>) -> Result<&'a str> {
+        let f = self.file.borrow() as &dyn ReadablePersist;
+        let offset = f.read_u64_at::<LE>(self.meta.index_offset + index * 8)?;
+        RawSSTEntry::read_user_key(ExtReader::new(f, offset, self.size), tmp)
     }
 }
 
@@ -329,11 +314,13 @@ impl RawSSTEntry {
         })
     }
 
-    fn read_user_key(mut buf: &[u8]) -> Result<&str> {
-        let key_len = buf.read_varint::<usize>()? - 8;
-        let _ = buf.read_varint::<usize>()?;
+    fn read_user_key<R: Read>(mut r: R, tmp: &mut Vec<u8>) -> Result<&str> {
+        let key_len = r.read_varint::<usize>()? - 8;
+        let _ = r.read_varint::<usize>()?;
+        tmp.resize(key_len, 0);
+        r.read_exact(tmp)?;
 
-        Ok(unsafe { std::str::from_utf8_unchecked(&buf[..(key_len as usize)]) })
+        Ok(unsafe { std::str::from_utf8_unchecked(&tmp[..(key_len as usize)]) })
     }
 }
 
@@ -367,29 +354,29 @@ impl RawSSTMetaInfo {
         Ok(())
     }
 
-    pub fn read(slice: &[u8]) -> io::Result<Self> {
+    pub fn read(r: &dyn ReadablePersist, size: u64) -> io::Result<Self> {
         // read tail first
-        let len = slice.len();
-        if len < 12 {
+        if size < 12 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid header"));
         }
+        let offset = size - 12;
+        let version = r.read_u32_at::<LE>(offset)?;
+        let meta_size = r.read_u32_at::<LE>(offset + 4)?;
+        let magic = r.read_u32_at::<LE>(offset + 8)?;
 
-        let magic = LE::read_u32(&slice[(len - 4)..]);
-        let meta_size = LE::read_u32(&slice[(len - 8)..(len - 4)]);
-        let version = LE::read_u32(&slice[(len - 12)..(len - 8)]);
-
-        if len < meta_size as usize {
+        if size < meta_size as u64 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid header meta size",
             ));
         }
 
-        let mut reader = slice[(len - meta_size as usize)..].reader();
-        let seq: u64 = reader.read_varint()?;
-        let level: u32 = reader.read_varint()?;
-        let total_keys: u64 = reader.read_varint()?;
-        let index_offset: u64 = reader.read_varint()?;
+        let offset = size - meta_size as u64;
+        let mut rr = ExtReader::new(r, offset, size);
+        let seq: u64 = rr.read_varint()?;
+        let level: u32 = rr.read_varint()?;
+        let total_keys: u64 = rr.read_varint()?;
+        let index_offset: u64 = rr.read_varint()?;
 
         Ok(Self {
             number: seq,
@@ -423,7 +410,7 @@ impl RawSSTWriter {
 impl Drop for RawSSTWriter {
     fn drop(&mut self) {
         if !self.success {
-            let _ = std::fs::remove_file(&self.name);
+            let _ = self.file.delete();
         }
     }
 }

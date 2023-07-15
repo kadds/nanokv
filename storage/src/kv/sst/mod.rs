@@ -2,6 +2,7 @@ use std::ops::{Bound, RangeBounds};
 
 use bytes::Bytes;
 
+use crate::backend::Backend;
 use crate::err::*;
 use crate::iterator::LevelIter;
 use crate::{
@@ -66,6 +67,7 @@ impl<'a> SnapshotTable<'a> {
         opt: &crate::GetOption,
         config: &Config,
         key: Bytes,
+        backend: &Backend,
         lifetime: &Lifetime<'b>,
     ) -> Result<(InternalKey, Value)> {
         for level in 0..MAX_LEVEL {
@@ -76,9 +78,7 @@ impl<'a> SnapshotTable<'a> {
                     if fs.meta().min_ver > self.snapshot.sequence() {
                         continue;
                     }
-                    let sst_reader =
-                        self.cache
-                            .get_opened_sst(config, fs.meta().level, fs.meta().number);
+                    let sst_reader = self.cache.get_opened_sst(config, fs.meta().number, backend);
 
                     match sst_reader.get(opt, key.clone(), lifetime) {
                         Ok(val) => return Ok(val),
@@ -104,6 +104,7 @@ impl<'a> SnapshotTable<'a> {
         opt: &crate::GetOption,
         config: &Config,
         range: R,
+        backend: &Backend,
         lifetime: &Lifetime<'b>,
     ) -> ScanIter<'b, (InternalKey, Value)> {
         let mut iters = Vec::new();
@@ -116,9 +117,7 @@ impl<'a> SnapshotTable<'a> {
                     if fs.meta().min_ver > self.snapshot.sequence() {
                         continue;
                     }
-                    let sst_reader =
-                        self.cache
-                            .get_opened_sst(config, fs.meta().level, fs.meta().number);
+                    let sst_reader = self.cache.get_opened_sst(config, fs.meta().number, backend);
 
                     file_iters.push(sst_reader.scan(
                         opt,

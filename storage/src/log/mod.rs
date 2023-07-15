@@ -61,10 +61,7 @@ impl LogEntrySerializer for String {
 mod test {
     use rand::{distributions::Alphanumeric, prelude::Distribution};
 
-    use crate::{
-        backend::{fs::memory::MemoryBasedPersistBackend, Backend},
-        err::StorageError,
-    };
+    use crate::backend::{fs::memory::MemoryBasedPersistBackend, Backend};
 
     struct TestSerializer;
     impl LogEntrySerializer for TestSerializer {

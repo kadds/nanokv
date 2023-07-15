@@ -30,6 +30,7 @@ thiserror = "1.0.40"
 fd-lock = "4.0"
 ouroboros = "0.17.0"
 pretty-hex = "0.3.0"
+positioned-io = "0.3.1"
 
 [dev-dependencies]
 criterion = "0.3"

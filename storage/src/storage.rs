@@ -286,8 +286,13 @@ impl Storage {
             super_version.sst_version.clone(),
             &self.inner.cache,
         )
-        .get(opt, self.inner.info.borrow_config(), key.clone(), &lifetime)
-        {
+        .get(
+            opt,
+            self.inner.info.borrow_config(),
+            key.clone(),
+            self.inner.info.borrow_backend(),
+            &lifetime,
+        ) {
             Ok((internal_key, value)) => {
                 if internal_key.key_type() == KeyType::Del {
                     return Err(StorageError::KeyNotExist);
@@ -336,6 +341,7 @@ impl Storage {
                 opt,
                 inner.info.borrow_config(),
                 range,
+                self.inner.info.borrow_backend(),
                 &lifetime,
             ),
         );
